@@ -19,6 +19,15 @@ WS_ASCII[12] = 1;
 WS_ASCII[13] = 1;
 WS_ASCII[32] = 1;
 
+const NON_WS = new Uint8Array(128);
+NON_WS.fill(1);
+NON_WS[9] = 0;
+NON_WS[10] = 0;
+NON_WS[11] = 0;
+NON_WS[12] = 0;
+NON_WS[13] = 0;
+NON_WS[32] = 0;
+
 // Special characters in renderInline: " & ' * < > [ \ `
 const INLINE_SPECIAL = new Uint8Array(128);
 INLINE_SPECIAL[34] = 1; // "
@@ -39,11 +48,15 @@ for (const ch of ['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '
 
 // HTML escapable characters: & < > " '
 const HTML_SPECIAL = new Uint8Array(128);
-HTML_SPECIAL[34] = 1;
-HTML_SPECIAL[38] = 1;
-HTML_SPECIAL[39] = 1;
-HTML_SPECIAL[60] = 1;
-HTML_SPECIAL[62] = 1;
+HTML_SPECIAL[34] = 1; // "
+HTML_SPECIAL[38] = 1; // &
+HTML_SPECIAL[39] = 1; // '
+HTML_SPECIAL[60] = 1; // <
+HTML_SPECIAL[62] = 1; // >
+
+const SAFE_STR_PROPS = new Set(['date', 'date_long', 'slug']);
+const SAFE_URL_PROPS = new Set(['url', 'newer_url', 'older_url']);
+const NUM_PROPS = new Set(['reading_minutes', 'count', 'number', 'total']);
 
 const PROTO_PROPS = new Set([
   'constructor', 'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf',
@@ -163,20 +176,12 @@ function isUnicodeSpace(c) {
 function countWords(text) {
   const len = text.length;
   let count = 0;
-  let inWord = false;
+  let prevWs = 1;
   for (let i = 0; i < len; i++) {
     const c = text.charCodeAt(i);
-    if (c > 32 && c < 128) {
-      if (!inWord) {
-        inWord = true;
-        count++;
-      }
-    } else if (c < 128 ? WS_ASCII[c] === 1 : isUnicodeSpace(c)) {
-      inWord = false;
-    } else if (!inWord) {
-      inWord = true;
-      count++;
-    }
+    const nw = c < 128 ? NON_WS[c] : (isUnicodeSpace(c) ? 0 : 1);
+    count += nw & prevWs;
+    prevWs = nw ^ 1;
   }
   return count;
 }
@@ -414,79 +419,6 @@ function parseFrontMatter(text) {
 
 // ---------------------------------------------------------------- Markdown
 
-let _spanClean = true;
-
-function findUnescapedChar(s, code, from, to) {
-  for (let j = from; j < to; j++) {
-    const ch = s.charCodeAt(j);
-    if (ch === 92 && j + 1 < to) {
-      const n = s.charCodeAt(j + 1);
-      if (n < 128 && ESCAPABLE[n] !== 0) {
-        j++;
-        continue;
-      }
-    }
-    if (ch === code) return j;
-  }
-  return -1;
-}
-
-function findUnescapedDoubleStar(s, from, to) {
-  const limit = to - 2;
-  let clean = true;
-  for (let j = from; j <= limit; j++) {
-    const ch = s.charCodeAt(j);
-    if (ch < 128 && INLINE_SPECIAL[ch] !== 0) {
-      if (ch === 42 && s.charCodeAt(j + 1) === 42) {
-        _spanClean = clean;
-        return j;
-      }
-      clean = false;
-      if (ch === 92 && j + 1 < to) {
-        const n = s.charCodeAt(j + 1);
-        if (n < 128 && ESCAPABLE[n] !== 0) {
-          j++;
-        }
-      }
-    }
-  }
-  return -1;
-}
-
-function findSingleStar(s, from, to) {
-  let clean = true;
-  for (let j = from; j < to; j++) {
-    const c = s.charCodeAt(j);
-    if (c < 128 && INLINE_SPECIAL[c] !== 0) {
-      if (c === 42) {
-        if (j + 1 < to && s.charCodeAt(j + 1) === 42) {
-          clean = false;
-          j++;
-          continue;
-        }
-        _spanClean = clean;
-        return j;
-      }
-      clean = false;
-      if (c === 92 && j + 1 < to) {
-        const n = s.charCodeAt(j + 1);
-        if (n < 128 && ESCAPABLE[n] !== 0) {
-          j++;
-        }
-      }
-    }
-  }
-  return -1;
-}
-
-function hasWhitespaceRange(s, from, to) {
-  for (let i = from; i < to; i++) {
-    const c = s.charCodeAt(i);
-    if (c < 128 ? WS_ASCII[c] !== 0 : isUnicodeSpace(c)) return true;
-  }
-  return false;
-}
-
 function renderInline(s, from, to, env) {
   let out = '';
   let plainStart = from;
@@ -512,10 +444,19 @@ function renderInline(s, from, to, env) {
       continue;
     }
     if (c === 96) {
-      const j = s.indexOf('`', i + 1);
-      if (j > i + 1 && j < to) {
+      let j = -1;
+      let clean = true;
+      for (let x = i + 1; x < to; x++) {
+        const ch = s.charCodeAt(x);
+        if (ch === 96) {
+          j = x;
+          break;
+        }
+        if (ch < 128 && HTML_SPECIAL[ch] !== 0) clean = false;
+      }
+      if (j > i + 1) {
         if (plainStart < i) out += s.slice(plainStart, i);
-        out += '<code>' + escapeHtmlRange(s, i + 1, j) + '</code>';
+        out += '<code>' + (clean ? s.slice(i + 1, j) : escapeHtmlRange(s, i + 1, j)) + '</code>';
         i = j + 1;
         plainStart = i;
       } else {
@@ -525,10 +466,26 @@ function renderInline(s, from, to, env) {
     }
     if (c === 42) {
       if (i + 1 < to && s.charCodeAt(i + 1) === 42) {
-        const j = findUnescapedDoubleStar(s, i + 2, to);
+        let j = -1;
+        let clean = true;
+        const limit = to - 2;
+        for (let x = i + 2; x <= limit; x++) {
+          const ch = s.charCodeAt(x);
+          if (ch < 128 && INLINE_SPECIAL[ch] !== 0) {
+            if (ch === 42 && s.charCodeAt(x + 1) === 42) {
+              j = x;
+              break;
+            }
+            clean = false;
+            if (ch === 92 && x + 1 < to) {
+              const n = s.charCodeAt(x + 1);
+              if (n < 128 && ESCAPABLE[n] !== 0) x++;
+            }
+          }
+        }
         if (j > i + 2) {
           if (plainStart < i) out += s.slice(plainStart, i);
-          out += '<strong>' + (_spanClean ? s.slice(i + 2, j) : renderInline(s, i + 2, j, env)) + '</strong>';
+          out += '<strong>' + (clean ? s.slice(i + 2, j) : renderInline(s, i + 2, j, env)) + '</strong>';
           i = j + 2;
           plainStart = i;
         } else {
@@ -536,10 +493,30 @@ function renderInline(s, from, to, env) {
         }
         continue;
       }
-      const j = findSingleStar(s, i + 1, to);
+      let j = -1;
+      let clean = true;
+      for (let x = i + 1; x < to; x++) {
+        const ch = s.charCodeAt(x);
+        if (ch < 128 && INLINE_SPECIAL[ch] !== 0) {
+          if (ch === 42) {
+            if (x + 1 < to && s.charCodeAt(x + 1) === 42) {
+              clean = false;
+              x++;
+              continue;
+            }
+            j = x;
+            break;
+          }
+          clean = false;
+          if (ch === 92 && x + 1 < to) {
+            const n = s.charCodeAt(x + 1);
+            if (n < 128 && ESCAPABLE[n] !== 0) x++;
+          }
+        }
+      }
       if (j > i + 1) {
         if (plainStart < i) out += s.slice(plainStart, i);
-        out += '<em>' + (_spanClean ? s.slice(i + 1, j) : renderInline(s, i + 1, j, env)) + '</em>';
+        out += '<em>' + (clean ? s.slice(i + 1, j) : renderInline(s, i + 1, j, env)) + '</em>';
         i = j + 1;
         plainStart = i;
       } else {
@@ -548,13 +525,43 @@ function renderInline(s, from, to, env) {
       continue;
     }
     if (c === 91) {
-      const k = findUnescapedChar(s, 93, i + 1, to);
+      let k = -1;
+      let cleanText = true;
+      for (let x = i + 1; x < to; x++) {
+        const ch = s.charCodeAt(x);
+        if (ch < 128 && INLINE_SPECIAL[ch] !== 0) {
+          cleanText = false;
+          if (ch === 92 && x + 1 < to) {
+            const n = s.charCodeAt(x + 1);
+            if (n < 128 && ESCAPABLE[n] !== 0) {
+              x++;
+              continue;
+            }
+          }
+        }
+        if (ch === 93) {
+          k = x;
+          break;
+        }
+      }
       if (k !== -1 && k + 1 < to && s.charCodeAt(k + 1) === 40) {
-        const m = s.indexOf(')', k + 2);
-        if (m !== -1 && m < to && m > k + 2 && !hasWhitespaceRange(s, k + 2, m)) {
+        let m = -1;
+        let hasWs = false;
+        for (let x = k + 2; x < to; x++) {
+          const ch = s.charCodeAt(x);
+          if (ch === 41) {
+            m = x;
+            break;
+          }
+          if (ch < 128 ? WS_ASCII[ch] !== 0 : isUnicodeSpace(ch)) {
+            hasWs = true;
+            break;
+          }
+        }
+        if (m > k + 2 && !hasWs) {
           if (plainStart < i) out += s.slice(plainStart, i);
           const target = s.slice(k + 2, m);
-          out += '<a href="' + escapeHtml(env.link(target)) + '">' + renderInline(s, i + 1, k, env) + '</a>';
+          out += '<a href="' + env.escapedLink(target) + '">' + (cleanText ? s.slice(i + 1, k) : renderInline(s, i + 1, k, env)) + '</a>';
           i = m + 1;
           plainStart = i;
           continue;
@@ -695,7 +702,7 @@ function renderMarkdown(src, env, slugify) {
   const ids = new Set();
   const toc = [];
   let excerpt = null;
-  let html = '';
+  const blocks = [];
 
   let pos = 0;
   while (pos < len) {
@@ -749,7 +756,7 @@ function renderMarkdown(src, env, slugify) {
         }
         if (trailingNl) bodyHtml += '\n';
         const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
-        html += `<pre><code${cls}>${bodyHtml}</code></pre>\n`;
+        blocks.push('<pre><code' + cls + '>' + bodyHtml + '</code></pre>\n');
         continue;
       }
     }
@@ -761,7 +768,7 @@ function renderMarkdown(src, env, slugify) {
       const hEnd = _hEnd;
       const id = uniqueSlug(slugify(src.slice(hStart, hEnd)), ids);
       const inlineHtml = renderInline(src, hStart, hEnd, env);
-      html += `<h${depth} id="${id}">${inlineHtml}</h${depth}>\n`;
+      blocks.push('<h' + depth + ' id="' + id + '">' + inlineHtml + '</h' + depth + '>\n');
       if (depth === 2 || depth === 3) {
         toc.push({ level: depth, id, html: inlineHtml });
       }
@@ -771,7 +778,7 @@ function renderMarkdown(src, env, slugify) {
 
     // HR
     if ((c0 === 45 || c0 === 42) && isHr(src, pos, end)) {
-      html += '<hr>\n';
+      blocks.push('<hr>\n');
       pos = nl === -1 ? len : nl + 1;
       continue;
     }
@@ -789,13 +796,13 @@ function renderMarkdown(src, env, slugify) {
         pos = qnl === -1 ? len : qnl + 1;
       }
       if (qLines.length === 0) {
-        html += '<blockquote>\n</blockquote>\n';
+        blocks.push('<blockquote>\n</blockquote>\n');
       } else if (qLines.length === 1) {
         const q = qLines[0];
-        html += `<blockquote>\n<p>${renderInline(q, 0, q.length, env)}</p>\n</blockquote>\n`;
+        blocks.push('<blockquote>\n<p>' + renderInline(q, 0, q.length, env) + '</p>\n</blockquote>\n');
       } else {
         const q = qLines.join('\n');
-        html += `<blockquote>\n<p>${renderInline(q, 0, q.length, env)}</p>\n</blockquote>\n`;
+        blocks.push('<blockquote>\n<p>' + renderInline(q, 0, q.length, env) + '</p>\n</blockquote>\n');
       }
       continue;
     }
@@ -810,7 +817,7 @@ function renderMarkdown(src, env, slugify) {
         const lend = lnl === -1 ? len : lnl;
         const lc0 = pos < lend ? src.charCodeAt(pos) : -1;
         if ((lc0 === 45 || lc0 === 42) && pos + 1 < lend && src.charCodeAt(pos + 1) === 32) {
-          listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n`;
+          listHtml += '<li>' + renderInline(curItem, 0, curItem.length, env) + '</li>\n';
           curItem = trimLineSlice(src, pos + 2, lend);
           pos = lnl === -1 ? len : lnl + 1;
         } else if (lc0 === 32 && isContinued(src, pos, lend)) {
@@ -820,8 +827,8 @@ function renderMarkdown(src, env, slugify) {
           break;
         }
       }
-      listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n</ul>\n`;
-      html += listHtml;
+      listHtml += '<li>' + renderInline(curItem, 0, curItem.length, env) + '</li>\n</ul>\n';
+      blocks.push(listHtml);
       continue;
     }
 
@@ -840,7 +847,7 @@ function renderMarkdown(src, env, slugify) {
           if (lc0 >= 48 && lc0 <= 57) {
             const mo = matchOrdered(src, pos, lend);
             if (mo !== -1) {
-              listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n`;
+              listHtml += '<li>' + renderInline(curItem, 0, curItem.length, env) + '</li>\n';
               curItem = trimLineSlice(src, mo, lend);
               pos = lnl === -1 ? len : lnl + 1;
               continue;
@@ -853,8 +860,8 @@ function renderMarkdown(src, env, slugify) {
             break;
           }
         }
-        listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n</ol>\n`;
-        html += listHtml;
+        listHtml += '<li>' + renderInline(curItem, 0, curItem.length, env) + '</li>\n</ol>\n';
+        blocks.push(listHtml);
         continue;
       }
     }
@@ -862,22 +869,20 @@ function renderMarkdown(src, env, slugify) {
     // Paragraph (contiguous zero-copy fast path when no line has leading/trailing [ \t])
     let pStart = pos;
     let pEnd = end;
-    let trimmedFirst = false;
     while (pStart < pEnd) {
       const ch = src.charCodeAt(pStart);
-      if (ch === 32 || ch === 9) { pStart++; trimmedFirst = true; }
+      if (ch === 32 || ch === 9) pStart++;
       else break;
     }
     while (pEnd > pStart) {
       const ch = src.charCodeAt(pEnd - 1);
-      if (ch === 32 || ch === 9) { pEnd--; trimmedFirst = true; }
+      if (ch === 32 || ch === 9) pEnd--;
       else break;
     }
     const contigStart = pStart;
     let contigEnd = pEnd;
     let extraLines = null;
-    // If first line had trailing whitespace, it can only stay contiguous if it's the ONLY line in the paragraph.
-    let firstHadTrailing = pEnd < end;
+    const firstHadTrailing = pEnd < end;
     pos = nl === -1 ? len : nl + 1;
 
     while (pos < len) {
@@ -912,10 +917,10 @@ function renderMarkdown(src, env, slugify) {
       inlineHtml = renderInline(pText, 0, pText.length, env);
     }
     if (excerpt === null) excerpt = inlineHtml;
-    html += `<p>${inlineHtml}</p>\n`;
+    blocks.push('<p>' + inlineHtml + '</p>\n');
   }
 
-  return { html, toc, excerpt: excerpt ?? '' };
+  return { html: blocks.join(''), toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- Templates
@@ -1067,7 +1072,7 @@ function resolveStaticValue(obj, path, startIdx) {
   return v;
 }
 
-function createTemplateRunner(templatesMap, siteGlobals) {
+function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
   const compiled = new Map();
   const staticPartials = new Map();
   const cardCache = new Map();
@@ -1114,7 +1119,7 @@ function createTemplateRunner(templatesMap, siteGlobals) {
       usedTmps.push(t);
       return t;
     };
-    const lines = ['let _o = "";'];
+    const lines = ['const _o = [];'];
 
     function isShadowed(rootKey, bindings) {
       for (let i = bindings.length - 1; i >= 0; i--) {
@@ -1127,6 +1132,14 @@ function createTemplateRunner(templatesMap, siteGlobals) {
       const rootKey = path[0];
       if (rootKey !== 'site' || isShadowed('site', bindings)) return null;
       return { found: true, val: resolveStaticValue(siteGlobals.site, path, 1) };
+    }
+
+    function isSafeNoEscapePath(path) {
+      if (path.length < 2) return false;
+      const last = path[path.length - 1];
+      if (SAFE_STR_PROPS.has(last) || NUM_PROPS.has(last)) return true;
+      if (baseSafe && SAFE_URL_PROPS.has(last)) return true;
+      return false;
     }
 
     function emitPath(path, bindings) {
@@ -1180,10 +1193,15 @@ function createTemplateRunner(templatesMap, siteGlobals) {
 
     function emitNodes(nodes, bindings, depth) {
       let textBuf = '';
-      const flushText = () => {
+      const exprParts = [];
+      const flushConcat = () => {
         if (textBuf !== '') {
-          lines.push(`_o += ${JSON.stringify(textBuf)};`);
+          exprParts.push(JSON.stringify(textBuf));
           textBuf = '';
+        }
+        if (exprParts.length > 0) {
+          lines.push(`_o.push(${exprParts.join(' + ')});`);
+          exprParts.length = 0;
         }
       };
 
@@ -1201,17 +1219,19 @@ function createTemplateRunner(templatesMap, siteGlobals) {
               textBuf += n.kind === 'var' ? escapeHtml(s) : s;
               break;
             }
-            flushText();
+            if (textBuf !== '') {
+              exprParts.push(JSON.stringify(textBuf));
+              textBuf = '';
+            }
             const expr = emitPath(n.path, bindings);
             if (n.path[0] === 'loop' && n.path.length === 2 && bindings.length > 0 && (n.path[1] === 'index' || n.path[1] === 'length')) {
-              lines.push(`_o += ${expr};`);
+              exprParts.push(expr);
             } else {
               const tv = trackedTmp('_v');
-              lines.push(`${tv} = ${expr};`);
-              if (n.kind === 'var') {
-                lines.push(`_o += typeof ${tv} === "string" ? _esc(${tv}) : _esc(_txt(${tv}));`);
+              if (n.kind === 'raw' || isSafeNoEscapePath(n.path)) {
+                exprParts.push(`(typeof (${tv} = ${expr}) === "string" ? ${tv} : _txt(${tv}))`);
               } else {
-                lines.push(`_o += typeof ${tv} === "string" ? ${tv} : _txt(${tv});`);
+                exprParts.push(`(typeof (${tv} = ${expr}) === "string" ? _esc(${tv}) : _esc(_txt(${tv})))`);
               }
             }
             break;
@@ -1223,12 +1243,11 @@ function createTemplateRunner(templatesMap, siteGlobals) {
               const truth = Array.isArray(v) ? v.length > 0 : (v !== undefined && v !== null && v !== false && v !== '' && v !== 0);
               const branch = truth !== n.not ? n.then : n.else;
               if (branch !== null) {
-                flushText();
                 emitNodes(branch, bindings, depth);
               }
               break;
             }
-            flushText();
+            flushConcat();
             const expr = emitPath(n.path, bindings);
             const tv = trackedTmp('_v');
             lines.push(`${tv} = ${expr};`);
@@ -1243,7 +1262,7 @@ function createTemplateRunner(templatesMap, siteGlobals) {
             break;
           }
           case 'for': {
-            flushText();
+            flushConcat();
             if (
               n.body.length === 1 && n.body[0].kind === 'include' &&
               n.name === 'p' && depth < INCLUDE_DEPTH
@@ -1267,7 +1286,7 @@ function createTemplateRunner(templatesMap, siteGlobals) {
                   lines.push(`if (Array.isArray(${arr})) {`);
                   lines.push(`const ${lenVar} = ${arr}.length;`);
                   lines.push(`for (let ${kVar} = 0; ${kVar} < ${lenVar}; ${kVar}++) {`);
-                  lines.push(`_o += _cardRender(${arr}[${kVar}], ${JSON.stringify(incName)}, ${depth + 1});`);
+                  lines.push(`_o.push(_cardRender(${arr}[${kVar}], ${JSON.stringify(incName)}, ${depth + 1}));`);
                   lines.push('}');
                   lines.push('}');
                   break;
@@ -1305,7 +1324,7 @@ function createTemplateRunner(templatesMap, siteGlobals) {
                 }
                 textBuf += rendered;
               } else {
-                flushText();
+                flushConcat();
                 emitNodes(inc, bindings, depth + 1);
               }
             }
@@ -1313,12 +1332,12 @@ function createTemplateRunner(templatesMap, siteGlobals) {
           }
         }
       }
-      flushText();
+      flushConcat();
     }
 
     emitNodes(ast, [], baseDepth);
     const decl = usedTmps.length > 0 ? `let ${usedTmps.join(', ')};` : '';
-    const code = `${decl}\n${lines.join('\n')}\nreturn _o;`;
+    const code = `${decl}\n${lines.join('\n')}\nreturn _o.join('');`;
     const fn = new Function('_r', '_esc', '_txt', '_cardRender', code);
     const wrapper = (vars) => fn(vars, escapeHtml, textOf, cardRender);
     compiled.set(cacheKey, wrapper);
@@ -1421,6 +1440,8 @@ export function run(input) {
   for (let i = 0; i < statics.length; i++) staticPaths.add(statics[i].path);
   const broken = new Set();
   const resolveDirCaches = new Map();
+  const extEscCache = new Map();
+  const dirEscLinkCaches = new Map();
 
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
@@ -1430,10 +1451,26 @@ export function run(input) {
       dirCache = new Map();
       resolveDirCaches.set(dir, dirCache);
     }
+    let dirEscCache = dirEscLinkCaches.get(dir);
+    if (dirEscCache === undefined) {
+      dirEscCache = new Map();
+      dirEscLinkCaches.set(dir, dirEscCache);
+    }
     const env = {
-      link(target) {
+      escapedLink(target) {
+        const fast = dirEscCache.get(target);
+        if (fast !== undefined) return fast;
+
         const c0 = target.charCodeAt(0);
-        if (c0 === 47 || c0 === 35 || hasUrlScheme(target)) return target;
+        if (c0 === 47 || c0 === 35 || hasUrlScheme(target)) {
+          let esc = extEscCache.get(target);
+          if (esc === undefined) {
+            esc = escapeHtml(target);
+            extEscCache.set(target, esc);
+          }
+          dirEscCache.set(target, esc);
+          return esc;
+        }
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
@@ -1451,10 +1488,19 @@ export function run(input) {
             }
             dirCache.set(rel, resolvedUrl);
           }
-          if (resolvedUrl !== null) return frag === '' ? resolvedUrl : `${resolvedUrl}${frag}`;
+          if (resolvedUrl !== null) {
+            const esc = escapeHtml(frag === '' ? resolvedUrl : `${resolvedUrl}${frag}`);
+            dirEscCache.set(target, esc);
+            return esc;
+          }
         }
         broken.add(`broken-link ${s.path} -> ${target}`);
-        return target;
+        let esc = extEscCache.get(target);
+        if (esc === undefined) {
+          esc = escapeHtml(target);
+          extEscCache.set(target, esc);
+        }
+        return esc;
       },
     };
     const md = renderMarkdown(s.body, env, slugify);
@@ -1578,8 +1624,9 @@ export function run(input) {
   const recent = new Array(recentCount);
   for (let i = 0; i < recentCount; i++) recent[i] = cards.get(posts[i]);
 
+  const baseSafe = escapeHtml(base) === base;
   const siteGlobals = { site, tags: allTags, recent };
-  const getCompiler = createTemplateRunner(templates, siteGlobals);
+  const getCompiler = createTemplateRunner(templates, siteGlobals, baseSafe);
   const output = {};
 
   for (let i = 0; i < kept.length; i++) {
