@@ -28,6 +28,15 @@ NON_WS[12] = 0;
 NON_WS[13] = 0;
 NON_WS[32] = 0;
 
+// First chars on a line that can stop a paragraph: \t(9), ' '(32), #(35), *(42), -(45), `(96)
+const PARA_STOP_FIRST = new Uint8Array(128);
+PARA_STOP_FIRST[9] = 1;
+PARA_STOP_FIRST[32] = 1;
+PARA_STOP_FIRST[35] = 1;
+PARA_STOP_FIRST[42] = 1;
+PARA_STOP_FIRST[45] = 1;
+PARA_STOP_FIRST[96] = 1;
+
 // Special characters in renderInline: " & ' * < > [ \ `
 const INLINE_SPECIAL = new Uint8Array(128);
 INLINE_SPECIAL[34] = 1; // "
@@ -173,15 +182,41 @@ function isUnicodeSpace(c) {
   );
 }
 
-function countWords(text) {
+function countWords(text, start) {
   const len = text.length;
   let count = 0;
   let prevWs = 1;
-  for (let i = 0; i < len; i++) {
+  let i = start;
+  const lim = len - 3;
+  while (i < lim) {
+    const c0 = text.charCodeAt(i);
+    const c1 = text.charCodeAt(i + 1);
+    const c2 = text.charCodeAt(i + 2);
+    const c3 = text.charCodeAt(i + 3);
+    if ((c0 | c1 | c2 | c3) < 128) {
+      const nw0 = NON_WS[c0];
+      count += nw0 & prevWs;
+      const nw1 = NON_WS[c1];
+      count += nw1 & (nw0 ^ 1);
+      const nw2 = NON_WS[c2];
+      count += nw2 & (nw1 ^ 1);
+      const nw3 = NON_WS[c3];
+      count += nw3 & (nw2 ^ 1);
+      prevWs = nw3 ^ 1;
+      i += 4;
+    } else {
+      const nw = c0 < 128 ? NON_WS[c0] : (isUnicodeSpace(c0) ? 0 : 1);
+      count += nw & prevWs;
+      prevWs = nw ^ 1;
+      i++;
+    }
+  }
+  while (i < len) {
     const c = text.charCodeAt(i);
     const nw = c < 128 ? NON_WS[c] : (isUnicodeSpace(c) ? 0 : 1);
     count += nw & prevWs;
     prevWs = nw ^ 1;
+    i++;
   }
   return count;
 }
@@ -414,7 +449,7 @@ function parseFrontMatter(text) {
   }
 
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  return { data, body: text.slice(closeEnd) };
+  return { data, bodyStart: closeEnd };
 }
 
 // ---------------------------------------------------------------- Markdown
@@ -697,14 +732,14 @@ function matchOrdered(src, start, end) {
   return p + 2;
 }
 
-function renderMarkdown(src, env, slugify) {
+function renderMarkdown(src, startPos, env, slugify) {
   const len = src.length;
   const ids = new Set();
   const toc = [];
   let excerpt = null;
-  const blocks = [];
+  let html = '';
 
-  let pos = 0;
+  let pos = startPos;
   while (pos < len) {
     const nl = src.indexOf('\n', pos);
     const end = nl === -1 ? len : nl;
@@ -732,7 +767,7 @@ function renderMarkdown(src, env, slugify) {
         let closed = false;
         while (pos <= len) {
           if (pos === len) {
-            if (len > 0 && src.charCodeAt(len - 1) === 10) {
+            if (len > startPos && src.charCodeAt(len - 1) === 10) {
               trailingNl = true;
             }
             pos = len + 1;
@@ -756,7 +791,7 @@ function renderMarkdown(src, env, slugify) {
         }
         if (trailingNl) bodyHtml += '\n';
         const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
-        blocks.push('<pre><code' + cls + '>' + bodyHtml + '</code></pre>\n');
+        html += `<pre><code${cls}>${bodyHtml}</code></pre>\n`;
         continue;
       }
     }
@@ -768,7 +803,7 @@ function renderMarkdown(src, env, slugify) {
       const hEnd = _hEnd;
       const id = uniqueSlug(slugify(src.slice(hStart, hEnd)), ids);
       const inlineHtml = renderInline(src, hStart, hEnd, env);
-      blocks.push('<h' + depth + ' id="' + id + '">' + inlineHtml + '</h' + depth + '>\n');
+      html += `<h${depth} id="${id}">${inlineHtml}</h${depth}>\n`;
       if (depth === 2 || depth === 3) {
         toc.push({ level: depth, id, html: inlineHtml });
       }
@@ -778,7 +813,7 @@ function renderMarkdown(src, env, slugify) {
 
     // HR
     if ((c0 === 45 || c0 === 42) && isHr(src, pos, end)) {
-      blocks.push('<hr>\n');
+      html += '<hr>\n';
       pos = nl === -1 ? len : nl + 1;
       continue;
     }
@@ -796,13 +831,13 @@ function renderMarkdown(src, env, slugify) {
         pos = qnl === -1 ? len : qnl + 1;
       }
       if (qLines.length === 0) {
-        blocks.push('<blockquote>\n</blockquote>\n');
+        html += '<blockquote>\n</blockquote>\n';
       } else if (qLines.length === 1) {
         const q = qLines[0];
-        blocks.push('<blockquote>\n<p>' + renderInline(q, 0, q.length, env) + '</p>\n</blockquote>\n');
+        html += `<blockquote>\n<p>${renderInline(q, 0, q.length, env)}</p>\n</blockquote>\n`;
       } else {
         const q = qLines.join('\n');
-        blocks.push('<blockquote>\n<p>' + renderInline(q, 0, q.length, env) + '</p>\n</blockquote>\n');
+        html += `<blockquote>\n<p>${renderInline(q, 0, q.length, env)}</p>\n</blockquote>\n`;
       }
       continue;
     }
@@ -817,7 +852,7 @@ function renderMarkdown(src, env, slugify) {
         const lend = lnl === -1 ? len : lnl;
         const lc0 = pos < lend ? src.charCodeAt(pos) : -1;
         if ((lc0 === 45 || lc0 === 42) && pos + 1 < lend && src.charCodeAt(pos + 1) === 32) {
-          listHtml += '<li>' + renderInline(curItem, 0, curItem.length, env) + '</li>\n';
+          listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n`;
           curItem = trimLineSlice(src, pos + 2, lend);
           pos = lnl === -1 ? len : lnl + 1;
         } else if (lc0 === 32 && isContinued(src, pos, lend)) {
@@ -827,8 +862,8 @@ function renderMarkdown(src, env, slugify) {
           break;
         }
       }
-      listHtml += '<li>' + renderInline(curItem, 0, curItem.length, env) + '</li>\n</ul>\n';
-      blocks.push(listHtml);
+      listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n</ul>\n`;
+      html += listHtml;
       continue;
     }
 
@@ -847,7 +882,7 @@ function renderMarkdown(src, env, slugify) {
           if (lc0 >= 48 && lc0 <= 57) {
             const mo = matchOrdered(src, pos, lend);
             if (mo !== -1) {
-              listHtml += '<li>' + renderInline(curItem, 0, curItem.length, env) + '</li>\n';
+              listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n`;
               curItem = trimLineSlice(src, mo, lend);
               pos = lnl === -1 ? len : lnl + 1;
               continue;
@@ -860,13 +895,13 @@ function renderMarkdown(src, env, slugify) {
             break;
           }
         }
-        listHtml += '<li>' + renderInline(curItem, 0, curItem.length, env) + '</li>\n</ol>\n';
-        blocks.push(listHtml);
+        listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n</ol>\n`;
+        html += listHtml;
         continue;
       }
     }
 
-    // Paragraph (contiguous zero-copy fast path when no line has leading/trailing [ \t])
+    // Paragraph (contiguous zero-copy fast path + 1-lookup paragraph stop filter)
     let pStart = pos;
     let pEnd = end;
     while (pStart < pEnd) {
@@ -890,10 +925,12 @@ function renderMarkdown(src, env, slugify) {
       const pend = pnl === -1 ? len : pnl;
       if (pos === pend) break;
       const pc0 = src.charCodeAt(pos);
-      if ((pc0 === 32 || pc0 === 9) && isBlankRange(src, pos, pend)) break;
-      if (pc0 === 96 && parseFenceOpen(src, pos, pend) !== null) break;
-      if (pc0 === 35 && matchHeading(src, pos, pend)) break;
-      if ((pc0 === 45 || pc0 === 42) && isHr(src, pos, pend)) break;
+      if (pc0 < 128 && PARA_STOP_FIRST[pc0] !== 0) {
+        if ((pc0 === 32 || pc0 === 9) && isBlankRange(src, pos, pend)) break;
+        if (pc0 === 96 && parseFenceOpen(src, pos, pend) !== null) break;
+        if (pc0 === 35 && matchHeading(src, pos, pend)) break;
+        if ((pc0 === 45 || pc0 === 42) && isHr(src, pos, pend)) break;
+      }
 
       const pcLast = src.charCodeAt(pend - 1);
       const needsTrim = pc0 === 32 || pc0 === 9 || pcLast === 32 || pcLast === 9;
@@ -917,10 +954,10 @@ function renderMarkdown(src, env, slugify) {
       inlineHtml = renderInline(pText, 0, pText.length, env);
     }
     if (excerpt === null) excerpt = inlineHtml;
-    blocks.push('<p>' + inlineHtml + '</p>\n');
+    html += `<p>${inlineHtml}</p>\n`;
   }
 
-  return { html: blocks.join(''), toc, excerpt: excerpt ?? '' };
+  return { html, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- Templates
@@ -1072,11 +1109,30 @@ function resolveStaticValue(obj, path, startIdx) {
   return v;
 }
 
+// Known root presence per render role for dead-branch elimination
+const ROLE_ABSENT = {
+  page: new Set(['tag', 'posts', 'pager']),
+  index: new Set(['page', 'tag']),
+  tag: new Set(['page', 'posts', 'pager']),
+  tags: new Set(['page', 'tag', 'posts', 'pager']),
+  card: new Set(['page', 'tag', 'posts', 'pager']),
+  site: new Set(['page', 'tag', 'posts', 'pager', 'p']),
+};
+const ROLE_PRESENT_OBJ = {
+  page: new Set(['page']),
+  index: new Set(['pager']),
+  tag: new Set(['tag']),
+  tags: new Set(),
+  card: new Set(['p']),
+  site: new Set(),
+};
+
 function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
   const compiled = new Map();
   const staticPartials = new Map();
   const cardCache = new Map();
   const freeVarsCache = new Map();
+  const cardVars = { site: siteGlobals.site, tags: siteGlobals.tags, recent: siteGlobals.recent, p: null };
 
   function getFreeVars(name, depth) {
     const k = `${name}@${depth}`;
@@ -1098,19 +1154,23 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
     }
     let html = byName.get(p);
     if (html === undefined) {
-      const subFn = compileEntry(incName, incDepth);
-      html = subFn({ site: siteGlobals.site, tags: siteGlobals.tags, recent: siteGlobals.recent, p });
+      const subFn = compileEntry(incName, incDepth, 'card');
+      cardVars.p = p;
+      html = subFn(cardVars);
       byName.set(p, html);
     }
     return html;
   }
 
-  function compileEntry(name, baseDepth = 0) {
-    const cacheKey = baseDepth === 0 ? name : `${name}@${baseDepth}`;
+  function compileEntry(name, baseDepth, role) {
+    const cacheKey = `${name}@${baseDepth}@${role}`;
     const cached = compiled.get(cacheKey);
     if (cached !== undefined) return cached;
     const ast = templatesMap.get(name);
     if (ast === undefined) return null;
+
+    const absentRoots = ROLE_ABSENT[role];
+    const presentRoots = ROLE_PRESENT_OBJ[role];
 
     let tmpId = 0;
     const usedTmps = [];
@@ -1128,10 +1188,16 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
       return false;
     }
 
-    function tryStaticSitePath(path, bindings) {
+    function tryStaticPath(path, bindings) {
       const rootKey = path[0];
-      if (rootKey !== 'site' || isShadowed('site', bindings)) return null;
-      return { found: true, val: resolveStaticValue(siteGlobals.site, path, 1) };
+      if (isShadowed(rootKey, bindings)) return null;
+      if (rootKey === 'site') {
+        return { found: true, val: resolveStaticValue(siteGlobals.site, path, 1) };
+      }
+      if (absentRoots.has(rootKey)) {
+        return { found: true, val: undefined };
+      }
+      return null;
     }
 
     function isSafeNoEscapePath(path) {
@@ -1182,29 +1248,31 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
       return cur;
     }
 
-    function isSiteOnlyInclude(incName, depth) {
+    function isSiteOnlyInclude(incName, depth, bindings) {
       if (depth > INCLUDE_DEPTH || !templatesMap.has(incName)) return false;
       const free = getFreeVars(incName, depth);
       for (const k of free) {
-        if (k !== 'site' && k !== 'tags' && k !== 'recent') return false;
+        if (k === 'site' || k === 'tags' || k === 'recent') continue;
+        if (!isShadowed(k, bindings) && absentRoots.has(k)) continue;
+        return false;
       }
       return true;
     }
 
-    function emitNodes(nodes, bindings, depth) {
-      let textBuf = '';
-      const exprParts = [];
-      const flushConcat = () => {
-        if (textBuf !== '') {
-          exprParts.push(JSON.stringify(textBuf));
-          textBuf = '';
-        }
-        if (exprParts.length > 0) {
-          lines.push(`_o.push(${exprParts.join(' + ')});`);
-          exprParts.length = 0;
-        }
-      };
+    let textBuf = '';
+    const exprParts = [];
+    const flushConcat = () => {
+      if (textBuf !== '') {
+        exprParts.push(JSON.stringify(textBuf));
+        textBuf = '';
+      }
+      if (exprParts.length > 0) {
+        lines.push(`_o.push(${exprParts.join(' + ')});`);
+        exprParts.length = 0;
+      }
+    };
 
+    function emitNodes(nodes, bindings, depth) {
       for (let i = 0; i < nodes.length; i++) {
         const n = nodes[i];
         switch (n.kind) {
@@ -1213,7 +1281,7 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
             break;
           case 'var':
           case 'raw': {
-            const st = tryStaticSitePath(n.path, bindings);
+            const st = tryStaticPath(n.path, bindings);
             if (st !== null) {
               const s = textOf(st.val);
               textBuf += n.kind === 'var' ? escapeHtml(s) : s;
@@ -1237,11 +1305,18 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
             break;
           }
           case 'if': {
-            const st = tryStaticSitePath(n.path, bindings);
+            const st = tryStaticPath(n.path, bindings);
             if (st !== null) {
               const v = st.val;
               const truth = Array.isArray(v) ? v.length > 0 : (v !== undefined && v !== null && v !== false && v !== '' && v !== 0);
               const branch = truth !== n.not ? n.then : n.else;
+              if (branch !== null) {
+                emitNodes(branch, bindings, depth);
+              }
+              break;
+            }
+            if (n.path.length === 1 && !isShadowed(n.path[0], bindings) && presentRoots.has(n.path[0])) {
+              const branch = !n.not ? n.then : n.else;
               if (branch !== null) {
                 emitNodes(branch, bindings, depth);
               }
@@ -1254,14 +1329,20 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
             const truth = `(Array.isArray(${tv}) ? ${tv}.length > 0 : (${tv} !== undefined && ${tv} !== null && ${tv} !== false && ${tv} !== "" && ${tv} !== 0))`;
             lines.push(`if (${n.not ? `!${truth}` : truth}) {`);
             emitNodes(n.then, bindings, depth);
+            flushConcat();
             if (n.else !== null) {
               lines.push('} else {');
               emitNodes(n.else, bindings, depth);
+              flushConcat();
             }
             lines.push('}');
             break;
           }
           case 'for': {
+            const st = tryStaticPath(n.path, bindings);
+            if (st !== null && !Array.isArray(st.val)) {
+              break;
+            }
             flushConcat();
             if (
               n.body.length === 1 && n.body[0].kind === 'include' &&
@@ -1305,6 +1386,7 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
             lines.push(`const ${elemVar} = ${arr}[${kVar}];`);
             bindings.push({ name: n.name, v: elemVar, k: kVar, len: lenVar });
             emitNodes(n.body, bindings, depth);
+            flushConcat();
             bindings.pop();
             lines.push('}');
             lines.push('}');
@@ -1314,11 +1396,11 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
             const inc = templatesMap.get(n.name);
             if (inc !== undefined && depth < INCLUDE_DEPTH) {
               const shadowed = isShadowed('site', bindings) || isShadowed('tags', bindings) || isShadowed('recent', bindings);
-              if (!shadowed && isSiteOnlyInclude(n.name, depth + 1)) {
-                const pKey = `${n.name}@${depth + 1}`;
+              if (!shadowed && isSiteOnlyInclude(n.name, depth + 1, bindings)) {
+                const pKey = `${n.name}@${depth + 1}@${role}`;
                 let rendered = staticPartials.get(pKey);
                 if (rendered === undefined) {
-                  const subFn = compileEntry(n.name, depth + 1);
+                  const subFn = compileEntry(n.name, depth + 1, role);
                   rendered = subFn(siteGlobals);
                   staticPartials.set(pKey, rendered);
                 }
@@ -1332,10 +1414,10 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
           }
         }
       }
-      flushConcat();
     }
 
     emitNodes(ast, [], baseDepth);
+    flushConcat();
     const decl = usedTmps.length > 0 ? `let ${usedTmps.join(', ')};` : '';
     const code = `${decl}\n${lines.join('\n')}\nreturn _o.join('');`;
     const fn = new Function('_r', '_esc', '_txt', '_cardRender', code);
@@ -1410,7 +1492,7 @@ export function run(input) {
       continue;
     }
     s.data = fm.data;
-    s.body = fm.body;
+    s.bodyStart = fm.bodyStart;
     s.post = post;
     s.layout = layout;
     kept.push(s);
@@ -1503,7 +1585,7 @@ export function run(input) {
         return esc;
       },
     };
-    const md = renderMarkdown(s.body, env, slugify);
+    const md = renderMarkdown(s.text, s.bodyStart, env, slugify);
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
@@ -1609,7 +1691,7 @@ export function run(input) {
     date_long: fmtDate(s.data.date),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(countWords(s.body) / 200)),
+    reading_minutes: Math.max(1, Math.ceil(countWords(s.text, s.bodyStart) / 200)),
     tags: s.tagRefs,
   });
 
@@ -1629,66 +1711,84 @@ export function run(input) {
   const getCompiler = createTemplateRunner(templates, siteGlobals, baseSafe);
   const output = {};
 
+  const reusePage = {
+    title: '',
+    url: '',
+    date: '',
+    date_long: '',
+    summary: '',
+    excerpt: '',
+    reading_minutes: 1,
+    tags: null,
+    slug: '',
+    content: '',
+    toc: null,
+    newer: null,
+    older: null,
+    is_post: false,
+  };
+  const pageVars = { site, tags: allTags, recent, page: reusePage };
+
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
-    const fn = getCompiler(s.layout, 0);
+    const fn = getCompiler(s.layout, 0, 'page');
     const c = s.post ? cards.get(s) : cardOf(s);
-    const page = {
-      title: c.title,
-      url: c.url,
-      date: c.date,
-      date_long: c.date_long,
-      summary: c.summary,
-      excerpt: c.excerpt,
-      reading_minutes: c.reading_minutes,
-      tags: c.tags,
-      slug: s.slug,
-      content: s.html,
-      toc: s.toc,
-      newer: linkOf(s.newer ?? null),
-      older: linkOf(s.older ?? null),
-      is_post: s.post,
-    };
-    output[`${s.outDir}/index.html`] = fn({ site, tags: allTags, recent, page });
+    reusePage.title = c.title;
+    reusePage.url = c.url;
+    reusePage.date = c.date;
+    reusePage.date_long = c.date_long;
+    reusePage.summary = c.summary;
+    reusePage.excerpt = c.excerpt;
+    reusePage.reading_minutes = c.reading_minutes;
+    reusePage.tags = c.tags;
+    reusePage.slug = s.slug;
+    reusePage.content = s.html;
+    reusePage.toc = s.toc;
+    reusePage.newer = linkOf(s.newer ?? null);
+    reusePage.older = linkOf(s.older ?? null);
+    reusePage.is_post = s.post;
+    output[`${s.outDir}/index.html`] = fn(pageVars);
   }
 
-  const indexFn = getCompiler('index', 0);
+  const indexFn = getCompiler('index', 0, 'index');
   if (indexFn !== null) {
     const per = input.site.per_page;
     const pages = Math.max(1, Math.ceil(posts.length / per));
     const indexUrl = (k) => (k === 1 ? `${base}/` : `${base}/page/${k}/`);
+    const reusePager = { number: 1, total: pages, url: '', newer_url: '', older_url: '' };
+    const indexVars = { site, tags: allTags, recent, posts: null, pager: reusePager };
     for (let k = 1; k <= pages; k++) {
       const start = (k - 1) * per;
       const end = Math.min(k * per, posts.length);
       const pagePosts = new Array(Math.max(0, end - start));
       for (let j = start; j < end; j++) pagePosts[j - start] = cards.get(posts[j]);
-      const pager = {
-        number: k,
-        total: pages,
-        url: indexUrl(k),
-        newer_url: k === 1 ? '' : indexUrl(k - 1),
-        older_url: k === pages ? '' : indexUrl(k + 1),
-      };
-      output[k === 1 ? 'index.html' : `page/${k}/index.html`] = indexFn({ site, tags: allTags, recent, posts: pagePosts, pager });
+      reusePager.number = k;
+      reusePager.url = indexUrl(k);
+      reusePager.newer_url = k === 1 ? '' : indexUrl(k - 1);
+      reusePager.older_url = k === pages ? '' : indexUrl(k + 1);
+      indexVars.posts = pagePosts;
+      output[k === 1 ? 'index.html' : `page/${k}/index.html`] = indexFn(indexVars);
     }
   }
 
-  const tagFn = getCompiler('tag', 0);
+  const tagFn = getCompiler('tag', 0, 'tag');
   if (tagFn !== null) {
+    const reuseTag = { name: '', slug: '', url: '', count: 0, posts: null };
+    const tagVars = { site, tags: allTags, recent, tag: reuseTag };
     for (let i = 0; i < tags.length; i++) {
       const t = tags[i];
       const tPosts = new Array(t.posts.length);
       for (let j = 0; j < t.posts.length; j++) tPosts[j] = cards.get(t.posts[j]);
-      output[`tags/${t.slug}/index.html`] = tagFn({
-        site,
-        tags: allTags,
-        recent,
-        tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: tPosts },
-      });
+      reuseTag.name = t.name;
+      reuseTag.slug = t.slug;
+      reuseTag.url = t.url;
+      reuseTag.count = t.posts.length;
+      reuseTag.posts = tPosts;
+      output[`tags/${t.slug}/index.html`] = tagFn(tagVars);
     }
   }
 
-  const tagsFn = getCompiler('tags', 0);
+  const tagsFn = getCompiler('tags', 0, 'tags');
   if (tagsFn !== null) {
     output['tags/index.html'] = tagsFn({ site, tags: allTags, recent });
   }
