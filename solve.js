@@ -1,5 +1,5 @@
-// Fast drop-in implementation of makefun-site 1.0.0.
-// Pure ES module with no external dependencies; each run(input) call is isolated with no cross-case caching.
+// High-speed zero-allocation Uint8Array/Buffer arena implementation of makefun-site 1.0.0.
+// Pure ES module with no external dependencies; each run(input) call resets cursors cleanly with no cross-case leakage.
 
 const REPORT_FILE = 'build-report.txt';
 const RESERVED = ['posts', 'tags', 'page'];
@@ -28,7 +28,7 @@ NON_WS[12] = 0;
 NON_WS[13] = 0;
 NON_WS[32] = 0;
 
-// First chars on a line that can stop a paragraph: \t(9), ' '(32), #(35), *(42), -(45), `(96)
+// First byte on a line that can stop a paragraph: \t(9), ' '(32), #(35), *(42), -(45), `(96)
 const PARA_STOP_FIRST = new Uint8Array(128);
 PARA_STOP_FIRST[9] = 1;
 PARA_STOP_FIRST[32] = 1;
@@ -37,8 +37,8 @@ PARA_STOP_FIRST[42] = 1;
 PARA_STOP_FIRST[45] = 1;
 PARA_STOP_FIRST[96] = 1;
 
-// Special characters in renderInline: " & ' * < > [ \ `
-const INLINE_SPECIAL = new Uint8Array(128);
+// Special bytes in renderInline: " & ' * < > [ \ ` (256-entry avoids <128 branch)
+const INLINE_SPECIAL = new Uint8Array(256);
 INLINE_SPECIAL[34] = 1; // "
 INLINE_SPECIAL[38] = 1; // &
 INLINE_SPECIAL[39] = 1; // '
@@ -49,52 +49,352 @@ INLINE_SPECIAL[91] = 1; // [
 INLINE_SPECIAL[92] = 1; // \
 INLINE_SPECIAL[96] = 1; // `
 
-// Characters escapable by backslash: \ ` * _ [ ] ( ) # + - . ! >
-const ESCAPABLE = new Uint8Array(128);
+// Escapable by backslash: \ ` * _ [ ] ( ) # + - . ! >
+const ESCAPABLE = new Uint8Array(256);
 for (const ch of ['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']) {
   ESCAPABLE[ch.charCodeAt(0)] = 1;
 }
 
-// HTML escapable characters: & < > " '
-const HTML_SPECIAL = new Uint8Array(128);
+// HTML escapable bytes: & < > " '
+const HTML_SPECIAL = new Uint8Array(256);
 HTML_SPECIAL[34] = 1; // "
 HTML_SPECIAL[38] = 1; // &
 HTML_SPECIAL[39] = 1; // '
 HTML_SPECIAL[60] = 1; // <
 HTML_SPECIAL[62] = 1; // >
 
-const SAFE_STR_PROPS = new Set(['date', 'date_long', 'slug']);
-const SAFE_URL_PROPS = new Set(['url', 'newer_url', 'older_url']);
-const NUM_PROPS = new Set(['reading_minutes', 'count', 'number', 'total']);
+// JSON escapable byte flags: any < 32, "(34), \(92)
+const JSON_SPECIAL = new Uint8Array(256);
+for (let i = 0; i < 32; i++) JSON_SPECIAL[i] = 1;
+JSON_SPECIAL[34] = 1;
+JSON_SPECIAL[92] = 1;
 
-const PROTO_PROPS = new Set([
-  'constructor', 'toString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf',
-  'propertyIsEnumerable', 'toLocaleString', '__proto__',
-  'at', 'concat', 'copyWithin', 'entries', 'every', 'fill', 'filter', 'find',
-  'findIndex', 'findLast', 'findLastIndex', 'flat', 'flatMap', 'forEach',
-  'includes', 'indexOf', 'join', 'keys', 'lastIndexOf', 'map', 'pop', 'push',
-  'reduce', 'reduceRight', 'reverse', 'shift', 'slice', 'some', 'sort',
-  'splice', 'toReversed', 'toSorted', 'toSpliced', 'unshift', 'values', 'with',
-]);
+const HEX_LO = '0123456789abcdef';
+
+// ---------------------------------------------------------------- Persistent Reusable Arenas
+
+let srcArena = Buffer.allocUnsafe(4 * 1024 * 1024);
+let srcPos = 0;
+
+let mdArena = Buffer.allocUnsafe(6 * 1024 * 1024);
+let mdPos = 0;
+
+let tplArena = Buffer.allocUnsafe(1024 * 1024);
+let tplPos = 0;
+
+let cardArena = Buffer.allocUnsafe(1024 * 1024);
+let cardPos = 0;
+
+let outArena = Buffer.allocUnsafe(8 * 1024 * 1024);
+let outU32 = new Uint32Array(outArena.buffer, outArena.byteOffset, outArena.byteLength >>> 2);
+let outPos = 0;
+
+let jsonArena = Buffer.allocUnsafe(10 * 1024 * 1024);
+let jsonPos = 0;
+
+let scratchArena = Buffer.allocUnsafe(256 * 1024);
+
+let linkArena = Buffer.allocUnsafe(512 * 1024);
+let linkPos = 0;
+
+function growArena(cur, minSize) {
+  let cap = cur.length;
+  while (cap < minSize) cap *= 2;
+  const next = Buffer.allocUnsafe(cap);
+  cur.copy(next, 0, 0, cur.length);
+  return next;
+}
+
+function ensureSrc(need) {
+  if (srcPos + need > srcArena.length) srcArena = growArena(srcArena, srcPos + need);
+}
+function ensureMd(need) {
+  if (mdPos + need > mdArena.length) mdArena = growArena(mdArena, mdPos + need);
+}
+function ensureTpl(need) {
+  if (tplPos + need > tplArena.length) tplArena = growArena(tplArena, tplPos + need);
+}
+function ensureCard(need) {
+  if (cardPos + need > cardArena.length) cardArena = growArena(cardArena, cardPos + need);
+}
+function ensureOut(need) {
+  if (outPos + need > outArena.length) {
+    outArena = growArena(outArena, outPos + need);
+    outU32 = new Uint32Array(outArena.buffer, outArena.byteOffset, outArena.byteLength >>> 2);
+  }
+}
+function ensureJson(need) {
+  if (jsonPos + need > jsonArena.length) jsonArena = growArena(jsonArena, jsonPos + need);
+}
+function ensureScratch(need) {
+  if (need > scratchArena.length) {
+    let cap = scratchArena.length;
+    while (cap < need) cap *= 2;
+    scratchArena = Buffer.allocUnsafe(cap);
+  }
+}
+function ensureLink(need) {
+  if (linkPos + need > linkArena.length) linkArena = growArena(linkArena, linkPos + need);
+}
+
+// Target output sink used by template VM: either outArena (default) or cardArena
+let vmBuf = outArena;
+let vmPos = 0;
+let vmIsCard = false;
+
+function ensureVm(need) {
+  if (vmIsCard) {
+    if (vmPos + need > cardArena.length) {
+      cardArena = growArena(cardArena, vmPos + need);
+      vmBuf = cardArena;
+    }
+  } else {
+    if (vmPos + need > outArena.length) {
+      outArena = growArena(outArena, vmPos + need);
+      outU32 = new Uint32Array(outArena.buffer, outArena.byteOffset, outArena.byteLength >>> 2);
+      vmBuf = outArena;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- Low-level Arena Writers
+
+function mdWriteAscii(str) {
+  const len = str.length;
+  if (mdPos + len > mdArena.length) ensureMd(len);
+  const b = mdArena;
+  let p = mdPos;
+  for (let i = 0; i < len; i++) b[p++] = str.charCodeAt(i);
+  mdPos = p;
+}
+
+function mdCopySpan(src, from, to) {
+  const len = to - from;
+  if (len <= 0) return;
+  if (mdPos + len > mdArena.length) ensureMd(len);
+  if (len <= 48) {
+    const b = mdArena;
+    let p = mdPos;
+    for (let i = from; i < to; i++) b[p++] = src[i];
+    mdPos = p;
+  } else {
+    src.copy(mdArena, mdPos, from, to);
+    mdPos += len;
+  }
+}
+
+function mdWriteEscapeSpan(src, from, to) {
+  const len = to - from;
+  if (len <= 0) return;
+  if (mdPos + len * 6 > mdArena.length) ensureMd(len * 6);
+  const dst = mdArena;
+  let p = mdPos;
+  let plain = from;
+  for (let i = from; i < to; i++) {
+    const c = src[i];
+    if (c < 128 && HTML_SPECIAL[c] !== 0) {
+      if (plain < i) {
+        const sl = i - plain;
+        if (sl <= 32) {
+          for (let k = plain; k < i; k++) dst[p++] = src[k];
+        } else {
+          src.copy(dst, p, plain, i);
+          p += sl;
+        }
+      }
+      if (c === 38) { // &amp;
+        dst[p] = 38; dst[p + 1] = 97; dst[p + 2] = 109; dst[p + 3] = 112; dst[p + 4] = 59; p += 5;
+      } else if (c === 60) { // &lt;
+        dst[p] = 38; dst[p + 1] = 108; dst[p + 2] = 116; dst[p + 3] = 59; p += 4;
+      } else if (c === 62) { // &gt;
+        dst[p] = 38; dst[p + 1] = 103; dst[p + 2] = 116; dst[p + 3] = 59; p += 4;
+      } else if (c === 34) { // &quot;
+        dst[p] = 38; dst[p + 1] = 113; dst[p + 2] = 117; dst[p + 3] = 111; dst[p + 4] = 116; dst[p + 5] = 59; p += 6;
+      } else { // &#39;
+        dst[p] = 38; dst[p + 1] = 35; dst[p + 2] = 51; dst[p + 3] = 57; dst[p + 4] = 59; p += 5;
+      }
+      plain = i + 1;
+    }
+  }
+  if (plain < to) {
+    const sl = to - plain;
+    if (sl <= 32) {
+      for (let k = plain; k < to; k++) dst[p++] = src[k];
+    } else {
+      src.copy(dst, p, plain, to);
+      p += sl;
+    }
+  }
+  mdPos = p;
+}
+
+function mdWriteStrUtf8(str) {
+  const len = str.length;
+  if (len === 0) return;
+  if (mdPos + len * 3 > mdArena.length) ensureMd(len * 3);
+  mdPos += mdArena.utf8Write(str, mdPos);
+}
+
+function mdWriteUint(n) {
+  if (n < 10) {
+    if (mdPos + 1 > mdArena.length) ensureMd(1);
+    mdArena[mdPos++] = 48 + n;
+    return;
+  }
+  const s = String(n);
+  mdWriteAscii(s);
+}
+
+function vmWriteBytes(src, from, to) {
+  const len = to - from;
+  if (len <= 0) return;
+  if (vmPos + len > vmBuf.length) ensureVm(len);
+  if (len <= 40) {
+    const dst = vmBuf;
+    let p = vmPos;
+    for (let i = from; i < to; i++) dst[p++] = src[i];
+    vmPos = p;
+  } else {
+    src.copy(vmBuf, vmPos, from, to);
+    vmPos += len;
+  }
+}
+
+function vmWriteEscapeSpan(src, from, to) {
+  const len = to - from;
+  if (len <= 0) return;
+  if (vmPos + len * 6 > vmBuf.length) ensureVm(len * 6);
+  const dst = vmBuf;
+  let p = vmPos;
+  let plain = from;
+  for (let i = from; i < to; i++) {
+    const c = src[i];
+    if (c < 128 && HTML_SPECIAL[c] !== 0) {
+      if (plain < i) {
+        const sl = i - plain;
+        if (sl <= 32) {
+          for (let k = plain; k < i; k++) dst[p++] = src[k];
+        } else {
+          src.copy(dst, p, plain, i);
+          p += sl;
+        }
+      }
+      if (c === 38) {
+        dst[p] = 38; dst[p + 1] = 97; dst[p + 2] = 109; dst[p + 3] = 112; dst[p + 4] = 59; p += 5;
+      } else if (c === 60) {
+        dst[p] = 38; dst[p + 1] = 108; dst[p + 2] = 116; dst[p + 3] = 59; p += 4;
+      } else if (c === 62) {
+        dst[p] = 38; dst[p + 1] = 103; dst[p + 2] = 116; dst[p + 3] = 59; p += 4;
+      } else if (c === 34) {
+        dst[p] = 38; dst[p + 1] = 113; dst[p + 2] = 117; dst[p + 3] = 111; dst[p + 4] = 116; dst[p + 5] = 59; p += 6;
+      } else {
+        dst[p] = 38; dst[p + 1] = 35; dst[p + 2] = 51; dst[p + 3] = 57; dst[p + 4] = 59; p += 5;
+      }
+      plain = i + 1;
+    }
+  }
+  if (plain < to) {
+    const sl = to - plain;
+    if (sl <= 32) {
+      for (let k = plain; k < to; k++) dst[p++] = src[k];
+    } else {
+      src.copy(dst, p, plain, to);
+      p += sl;
+    }
+  }
+  vmPos = p;
+}
+
+function vmWriteStrRaw(str) {
+  const len = str.length;
+  if (len === 0) return;
+  if (vmPos + len * 3 > vmBuf.length) ensureVm(len * 3);
+  const dst = vmBuf;
+  let p = vmPos;
+  for (let i = 0; i < len; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 128) {
+      dst[p++] = c;
+    } else {
+      vmPos += dst.utf8Write(str, vmPos);
+      return;
+    }
+  }
+  vmPos = p;
+}
+
+function vmWriteStrEscaped(str) {
+  const len = str.length;
+  if (len === 0) return;
+  if (vmPos + len * 6 > vmBuf.length) ensureVm(len * 6);
+  const dst = vmBuf;
+  let p = vmPos;
+  for (let i = 0; i < len; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 128) {
+      if (HTML_SPECIAL[c] === 0) {
+        dst[p++] = c;
+      } else if (c === 38) {
+        dst[p] = 38; dst[p + 1] = 97; dst[p + 2] = 109; dst[p + 3] = 112; dst[p + 4] = 59; p += 5;
+      } else if (c === 60) {
+        dst[p] = 38; dst[p + 1] = 108; dst[p + 2] = 116; dst[p + 3] = 59; p += 4;
+      } else if (c === 62) {
+        dst[p] = 38; dst[p + 1] = 103; dst[p + 2] = 116; dst[p + 3] = 59; p += 4;
+      } else if (c === 34) {
+        dst[p] = 38; dst[p + 1] = 113; dst[p + 2] = 117; dst[p + 3] = 111; dst[p + 4] = 116; dst[p + 5] = 59; p += 6;
+      } else {
+        dst[p] = 38; dst[p + 1] = 35; dst[p + 2] = 51; dst[p + 3] = 57; dst[p + 4] = 59; p += 5;
+      }
+    } else {
+      // Non-ASCII: encode into scratch, then byte-escape
+      ensureScratch(len * 3);
+      const nb = scratchArena.utf8Write(str, 0);
+      vmWriteEscapeSpan(scratchArena, 0, nb);
+      return;
+    }
+  }
+  vmPos = p;
+}
+
+function vmWriteInt(n) {
+  if (n >= 0 && n < 10000) {
+    if (vmPos + 4 > vmBuf.length) ensureVm(4);
+    const dst = vmBuf;
+    let p = vmPos;
+    if (n < 10) {
+      dst[p++] = 48 + n;
+    } else if (n < 100) {
+      const q = (n / 10) | 0;
+      dst[p++] = 48 + q;
+      dst[p++] = 48 + (n - q * 10);
+    } else if (n < 1000) {
+      const q1 = (n / 100) | 0;
+      const r1 = n - q1 * 100;
+      const q2 = (r1 / 10) | 0;
+      dst[p++] = 48 + q1;
+      dst[p++] = 48 + q2;
+      dst[p++] = 48 + (r1 - q2 * 10);
+    } else {
+      const q1 = (n / 1000) | 0;
+      const r1 = n - q1 * 1000;
+      const q2 = (r1 / 100) | 0;
+      const r2 = r1 - q2 * 100;
+      const q3 = (r2 / 10) | 0;
+      dst[p++] = 48 + q1;
+      dst[p++] = 48 + q2;
+      dst[p++] = 48 + q3;
+      dst[p++] = 48 + (r2 - q3 * 10);
+    }
+    vmPos = p;
+    return;
+  }
+  vmWriteStrRaw(String(n));
+}
+
+// ---------------------------------------------------------------- Common Helpers
 
 function byCodeUnits(a, b) {
   return a < b ? -1 : a > b ? 1 : 0;
-}
-
-function escapeHtmlRange(text, start, end) {
-  let last = start;
-  let out = '';
-  for (let i = start; i < end; i++) {
-    const c = text.charCodeAt(i);
-    if (c < 128 && HTML_SPECIAL[c] !== 0) {
-      if (last < i) out += text.slice(last, i);
-      out += c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;';
-      last = i + 1;
-    }
-  }
-  if (last === start) return text.slice(start, end);
-  if (last < end) out += text.slice(last, end);
-  return out;
 }
 
 function escapeHtml(text) {
@@ -116,7 +416,7 @@ function escapeHtml(text) {
 
 function createSlugifier() {
   const cache = new Map();
-  return function slugify(text) {
+  function slugifyStr(text) {
     const hit = cache.get(text);
     if (hit !== undefined) return hit;
 
@@ -151,7 +451,37 @@ function createSlugifier() {
     const res = out === '' ? 'untitled' : out;
     cache.set(text, res);
     return res;
-  };
+  }
+
+  // Zero-alloc ASCII fast slugifier for headings on srcArena/buf
+  const slugTmp = new Uint8Array(64);
+  function slugifyBuf(buf, start, end) {
+    for (let i = start; i < end; i++) {
+      if (buf[i] >= 128) return slugifyStr(buf.toString('utf8', start, end));
+    }
+    let outLen = 0;
+    let gap = false;
+    for (let i = start; i < end; i++) {
+      let c = buf[i];
+      if (c >= 65 && c <= 90) c += 32;
+      else if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57))) {
+        if (outLen > 0) gap = true;
+        continue;
+      }
+      if (gap) {
+        if (outLen >= 63) break;
+        slugTmp[outLen++] = 45;
+        gap = false;
+      } else if (outLen >= SLUG_MAX) {
+        break;
+      }
+      slugTmp[outLen++] = c;
+    }
+    if (outLen === 0) return 'untitled';
+    return Buffer.from(slugTmp.buffer, 0, outLen).toString('latin1');
+  }
+
+  return { slugifyStr, slugifyBuf };
 }
 
 function uniqueSlug(slug, taken) {
@@ -174,94 +504,163 @@ function longDate(date) {
   return `${d} ${MONTHS[m - 1]} ${date.slice(0, 4)}`;
 }
 
-function isUnicodeSpace(c) {
-  return (
-    c === 0x00a0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) ||
-    c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f ||
-    c === 0x3000 || c === 0xfeff
-  );
+// Check UTF-8 Unicode space starting at buf[i] (< end). Returns byte length (2 or 3) if Unicode space, else 0.
+function unicodeSpaceByteLen(buf, i, end) {
+  const b0 = buf[i];
+  if (b0 === 0xc2) {
+    return i + 1 < end && buf[i + 1] === 0xa0 ? 2 : 0;
+  }
+  if (b0 === 0xe1) {
+    return i + 2 < end && buf[i + 1] === 0x9a && buf[i + 2] === 0x80 ? 3 : 0;
+  }
+  if (b0 === 0xe2) {
+    if (i + 2 >= end) return 0;
+    const b1 = buf[i + 1];
+    const b2 = buf[i + 2];
+    if (b1 === 0x80) {
+      return ((b2 >= 0x80 && b2 <= 0x8a) || b2 === 0xa8 || b2 === 0xa9 || b2 === 0xaf) ? 3 : 0;
+    }
+    return b1 === 0x81 && b2 === 0x9f ? 3 : 0;
+  }
+  if (b0 === 0xe3) {
+    return i + 2 < end && buf[i + 1] === 0x80 && buf[i + 2] === 0x80 ? 3 : 0;
+  }
+  if (b0 === 0xef) {
+    return i + 2 < end && buf[i + 1] === 0xbb && buf[i + 2] === 0xbf ? 3 : 0;
+  }
+  return 0;
 }
 
-function countWords(text, start) {
-  const len = text.length;
+function utf8SeqLen(b0) {
+  if (b0 < 0xc0) return 1;
+  if (b0 < 0xe0) return 2;
+  if (b0 < 0xf0) return 3;
+  return 4;
+}
+
+function countWordsBytes(buf, start, end) {
   let count = 0;
   let prevWs = 1;
   let i = start;
-  const lim = len - 3;
+  const lim = end - 3;
   while (i < lim) {
-    const c0 = text.charCodeAt(i);
-    const c1 = text.charCodeAt(i + 1);
-    const c2 = text.charCodeAt(i + 2);
-    const c3 = text.charCodeAt(i + 3);
-    if ((c0 | c1 | c2 | c3) < 128) {
-      const nw0 = NON_WS[c0];
+    const b0 = buf[i];
+    const b1 = buf[i + 1];
+    const b2 = buf[i + 2];
+    const b3 = buf[i + 3];
+    if ((b0 | b1 | b2 | b3) < 128) {
+      const nw0 = NON_WS[b0];
       count += nw0 & prevWs;
-      const nw1 = NON_WS[c1];
+      const nw1 = NON_WS[b1];
       count += nw1 & (nw0 ^ 1);
-      const nw2 = NON_WS[c2];
+      const nw2 = NON_WS[b2];
       count += nw2 & (nw1 ^ 1);
-      const nw3 = NON_WS[c3];
+      const nw3 = NON_WS[b3];
       count += nw3 & (nw2 ^ 1);
       prevWs = nw3 ^ 1;
       i += 4;
-    } else {
-      const nw = c0 < 128 ? NON_WS[c0] : (isUnicodeSpace(c0) ? 0 : 1);
+    } else if (b0 < 128) {
+      const nw = NON_WS[b0];
       count += nw & prevWs;
       prevWs = nw ^ 1;
       i++;
+    } else {
+      const us = unicodeSpaceByteLen(buf, i, end);
+      if (us !== 0) {
+        prevWs = 1;
+        i += us;
+      } else {
+        count += prevWs;
+        prevWs = 0;
+        const sl = utf8SeqLen(b0);
+        i = i + sl <= end ? i + sl : end;
+      }
     }
   }
-  while (i < len) {
-    const c = text.charCodeAt(i);
-    const nw = c < 128 ? NON_WS[c] : (isUnicodeSpace(c) ? 0 : 1);
-    count += nw & prevWs;
-    prevWs = nw ^ 1;
-    i++;
+  while (i < end) {
+    const b0 = buf[i];
+    if (b0 < 128) {
+      const nw = NON_WS[b0];
+      count += nw & prevWs;
+      prevWs = nw ^ 1;
+      i++;
+    } else {
+      const us = unicodeSpaceByteLen(buf, i, end);
+      if (us !== 0) {
+        prevWs = 1;
+        i += us;
+      } else {
+        count += prevWs;
+        prevWs = 0;
+        const sl = utf8SeqLen(b0);
+        i = i + sl <= end ? i + sl : end;
+      }
+    }
   }
   return count;
 }
 
 function dirOf(path) {
-  const idx = path.lastIndexOf('/');
-  return idx === -1 ? '' : path.slice(0, idx);
+  const i = path.lastIndexOf('/');
+  return i === -1 ? '' : path.slice(0, i);
+}
+
+function findNl(buf, pos, end) {
+  while (pos < end && buf[pos] !== 10) pos++;
+  return pos;
+}
+
+function mdCopyFast(src, from, to) {
+  const len = to - from;
+  if (len <= 0) return;
+  const dst = mdArena;
+  let p = mdPos;
+  if (len <= 48) {
+    for (let i = from; i < to; i++) dst[p++] = src[i];
+  } else {
+    src.copy(dst, p, from, to);
+    p += len;
+  }
+  mdPos = p;
 }
 
 function resolvePath(dir, rel) {
+  if (rel.indexOf('..') === -1 && rel.indexOf('./') === -1 && rel.indexOf('//') === -1 && rel !== '.' && !rel.startsWith('/') && !rel.endsWith('/')) {
+    return dir === '' ? rel : `${dir}/${rel}`;
+  }
   const parts = dir === '' ? [] : dir.split('/');
-  let start = 0;
-  const rlen = rel.length;
-  while (start <= rlen) {
-    const slash = rel.indexOf('/', start);
-    const end = slash === -1 ? rlen : slash;
-    const segLen = end - start;
-    if (segLen === 0 || (segLen === 1 && rel.charCodeAt(start) === 46)) {
-      // '' or '.'
-    } else if (segLen === 2 && rel.charCodeAt(start) === 46 && rel.charCodeAt(start + 1) === 46) {
+  const segs = rel.split('/');
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
       if (parts.length === 0) return null;
       parts.pop();
     } else {
-      parts.push(rel.slice(start, end));
+      parts.push(seg);
     }
-    if (slash === -1) break;
-    start = slash + 1;
   }
   return parts.join('/');
 }
 
 function hasUrlScheme(target) {
-  const colon = target.indexOf(':');
-  if (colon <= 0) return false;
+  const len = target.length;
+  if (len < 2) return false;
   const c0 = target.charCodeAt(0);
   if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))) return false;
-  for (let i = 1; i < colon; i++) {
+  for (let i = 1; i < len; i++) {
     const c = target.charCodeAt(i);
+    if (c === 58) return true;
     if (
-      !((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46)
+      !(c >= 65 && c <= 90) &&
+      !(c >= 97 && c <= 122) &&
+      !(c >= 48 && c <= 57) &&
+      c !== 43 && c !== 45 && c !== 46
     ) {
       return false;
     }
   }
-  return true;
+  return false;
 }
 
 // ---------------------------------------------------------------- Front Matter
@@ -269,10 +668,10 @@ function hasUrlScheme(target) {
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const NAME_RE = /^[a-z0-9-]+$/;
 const SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const TAG_RE = /^[^"[\]]+$/;
+const TAG_RE = /^[^"\[\]]+$/;
 
 function daysIn(y, m) {
-  if (m === 2) return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0 ? 29 : 28;
+  if (m === 2) return y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0) ? 29 : 28;
   return m === 4 || m === 6 || m === 9 || m === 11 ? 30 : 31;
 }
 
@@ -357,81 +756,81 @@ function valueOf(key, raw) {
   }
 }
 
-function parseFrontMatter(text) {
-  const len = text.length;
-  if (len < 3 || text.charCodeAt(0) !== 45 || text.charCodeAt(1) !== 45 || text.charCodeAt(2) !== 45) {
+function parseFrontMatterBytes(buf, start, end) {
+  const len = end - start;
+  if (len < 3 || buf[start] !== 45 || buf[start + 1] !== 45 || buf[start + 2] !== 45) {
     return { error: 'no front matter' };
   }
   if (len === 3) return { error: 'the front matter is not closed' };
-  if (text.charCodeAt(3) !== 10) return { error: 'no front matter' };
+  if (buf[start + 3] !== 10) return { error: 'no front matter' };
 
   let closeStart = -1;
   let closeEnd = -1;
-  let scan = 4;
-  while (scan <= len) {
-    const nl = text.indexOf('\n', scan);
-    const end = nl === -1 ? len : nl;
-    if (end - scan === 3 && text.charCodeAt(scan) === 45 && text.charCodeAt(scan + 1) === 45 && text.charCodeAt(scan + 2) === 45) {
+  let scan = start + 4;
+  while (scan <= end) {
+    const lEnd = findNl(buf, scan, end);
+    if (lEnd - scan === 3 && buf[scan] === 45 && buf[scan + 1] === 45 && buf[scan + 2] === 45) {
       closeStart = scan;
-      closeEnd = nl === -1 ? len : nl + 1;
+      closeEnd = lEnd < end ? lEnd + 1 : end;
       break;
     }
-    if (nl === -1) break;
-    scan = nl + 1;
+    if (lEnd >= end) break;
+    scan = lEnd + 1;
   }
   if (closeStart === -1) return { error: 'the front matter is not closed' };
 
   const data = {};
-  let p = 4;
+  let p = start + 4;
   let lineNum = 2;
   while (p < closeStart) {
-    const end = text.indexOf('\n', p);
-    const c0 = p < end ? text.charCodeAt(p) : -1;
+    const lEnd = findNl(buf, p, closeStart);
+    const c0 = p < lEnd ? buf[p] : -1;
     if (c0 === 35) {
-      p = end + 1;
+      p = lEnd + 1;
       lineNum++;
       continue;
     }
     if (c0 === -1 || c0 === 32 || c0 === 9) {
       let onlyWs = true;
-      for (let k = p; k < end; k++) {
-        const ch = text.charCodeAt(k);
+      for (let k = p; k < lEnd; k++) {
+        const ch = buf[k];
         if (ch !== 32 && ch !== 9) {
           onlyWs = false;
           break;
         }
       }
       if (onlyWs) {
-        p = end + 1;
+        p = lEnd + 1;
         lineNum++;
         continue;
       }
     }
 
     let kEnd = p;
-    while (kEnd < end) {
-      const ch = text.charCodeAt(kEnd);
+    while (kEnd < lEnd) {
+      const ch = buf[kEnd];
       if ((ch >= 97 && ch <= 122) || ch === 95) kEnd++;
       else break;
     }
-    if (kEnd === p || kEnd >= end || text.charCodeAt(kEnd) !== 58) {
+    if (kEnd === p || kEnd >= lEnd || buf[kEnd] !== 58) {
       return { error: `line ${lineNum} is not "key: value"` };
     }
+
     let raw = '';
-    if (kEnd + 1 < end) {
-      if (text.charCodeAt(kEnd + 1) !== 32) {
+    if (kEnd + 1 < lEnd) {
+      if (buf[kEnd + 1] !== 32) {
         return { error: `line ${lineNum} is not "key: value"` };
       }
-      let rEnd = end;
+      let rEnd = lEnd;
       while (rEnd > kEnd + 2) {
-        const ch = text.charCodeAt(rEnd - 1);
+        const ch = buf[rEnd - 1];
         if (ch === 32 || ch === 9) rEnd--;
         else break;
       }
-      raw = text.slice(kEnd + 2, rEnd);
+      raw = buf.toString('utf8', kEnd + 2, rEnd);
     }
 
-    const key = text.slice(p, kEnd);
+    const key = buf.toString('latin1', p, kEnd);
     if (
       key !== 'title' && key !== 'date' && key !== 'tags' &&
       key !== 'draft' && key !== 'layout' && key !== 'slug' && key !== 'summary'
@@ -444,7 +843,7 @@ function parseFrontMatter(text) {
     if ('error' in v) return v;
     data[key] = v.value;
 
-    p = end + 1;
+    p = lEnd + 1;
     lineNum++;
   }
 
@@ -452,24 +851,29 @@ function parseFrontMatter(text) {
   return { data, bodyStart: closeEnd };
 }
 
-// ---------------------------------------------------------------- Markdown
+// ---------------------------------------------------------------- Markdown -> mdArena
 
-function renderInline(s, from, to, env) {
-  let out = '';
+function renderInlineToArena(buf, from, to, env) {
   let plainStart = from;
   let i = from;
+  const sp = INLINE_SPECIAL;
+  const lim4 = to - 3;
   while (i < to) {
-    const c = s.charCodeAt(i);
-    if (c >= 128 || INLINE_SPECIAL[c] === 0) {
-      i++;
-      continue;
+    while (i < lim4 && (sp[buf[i]] | sp[buf[i + 1]] | sp[buf[i + 2]] | sp[buf[i + 3]]) === 0) {
+      i += 4;
     }
+    while (i < to && sp[buf[i]] === 0) {
+      i++;
+    }
+    if (i >= to) break;
+    const c = buf[i];
     if (c === 92) {
       if (i + 1 < to) {
-        const next = s.charCodeAt(i + 1);
-        if (next < 128 && ESCAPABLE[next] !== 0) {
-          if (plainStart < i) out += s.slice(plainStart, i);
-          out += next === 62 ? '&gt;' : s[i + 1];
+        const next = buf[i + 1];
+        if (ESCAPABLE[next] !== 0) {
+          if (plainStart < i) mdCopyFast(buf, plainStart, i);
+          if (next === 62) mdWriteAscii('&gt;');
+          else mdArena[mdPos++] = next;
           i += 2;
           plainStart = i;
           continue;
@@ -482,16 +886,19 @@ function renderInline(s, from, to, env) {
       let j = -1;
       let clean = true;
       for (let x = i + 1; x < to; x++) {
-        const ch = s.charCodeAt(x);
+        const ch = buf[x];
         if (ch === 96) {
           j = x;
           break;
         }
-        if (ch < 128 && HTML_SPECIAL[ch] !== 0) clean = false;
+        if (HTML_SPECIAL[ch] !== 0) clean = false;
       }
       if (j > i + 1) {
-        if (plainStart < i) out += s.slice(plainStart, i);
-        out += '<code>' + (clean ? s.slice(i + 1, j) : escapeHtmlRange(s, i + 1, j)) + '</code>';
+        if (plainStart < i) mdCopyFast(buf, plainStart, i);
+        mdWriteAscii('<code>');
+        if (clean) mdCopyFast(buf, i + 1, j);
+        else mdWriteEscapeSpan(buf, i + 1, j);
+        mdWriteAscii('</code>');
         i = j + 1;
         plainStart = i;
       } else {
@@ -500,27 +907,29 @@ function renderInline(s, from, to, env) {
       continue;
     }
     if (c === 42) {
-      if (i + 1 < to && s.charCodeAt(i + 1) === 42) {
+      if (i + 1 < to && buf[i + 1] === 42) {
         let j = -1;
         let clean = true;
         const limit = to - 2;
         for (let x = i + 2; x <= limit; x++) {
-          const ch = s.charCodeAt(x);
-          if (ch < 128 && INLINE_SPECIAL[ch] !== 0) {
-            if (ch === 42 && s.charCodeAt(x + 1) === 42) {
+          const ch = buf[x];
+          if (sp[ch] !== 0) {
+            if (ch === 42 && buf[x + 1] === 42) {
               j = x;
               break;
             }
             clean = false;
             if (ch === 92 && x + 1 < to) {
-              const n = s.charCodeAt(x + 1);
-              if (n < 128 && ESCAPABLE[n] !== 0) x++;
+              if (ESCAPABLE[buf[x + 1]] !== 0) x++;
             }
           }
         }
         if (j > i + 2) {
-          if (plainStart < i) out += s.slice(plainStart, i);
-          out += '<strong>' + (clean ? s.slice(i + 2, j) : renderInline(s, i + 2, j, env)) + '</strong>';
+          if (plainStart < i) mdCopyFast(buf, plainStart, i);
+          mdWriteAscii('<strong>');
+          if (clean) mdCopyFast(buf, i + 2, j);
+          else renderInlineToArena(buf, i + 2, j, env);
+          mdWriteAscii('</strong>');
           i = j + 2;
           plainStart = i;
         } else {
@@ -531,10 +940,10 @@ function renderInline(s, from, to, env) {
       let j = -1;
       let clean = true;
       for (let x = i + 1; x < to; x++) {
-        const ch = s.charCodeAt(x);
-        if (ch < 128 && INLINE_SPECIAL[ch] !== 0) {
+        const ch = buf[x];
+        if (sp[ch] !== 0) {
           if (ch === 42) {
-            if (x + 1 < to && s.charCodeAt(x + 1) === 42) {
+            if (x + 1 < to && buf[x + 1] === 42) {
               clean = false;
               x++;
               continue;
@@ -544,14 +953,16 @@ function renderInline(s, from, to, env) {
           }
           clean = false;
           if (ch === 92 && x + 1 < to) {
-            const n = s.charCodeAt(x + 1);
-            if (n < 128 && ESCAPABLE[n] !== 0) x++;
+            if (ESCAPABLE[buf[x + 1]] !== 0) x++;
           }
         }
       }
       if (j > i + 1) {
-        if (plainStart < i) out += s.slice(plainStart, i);
-        out += '<em>' + (clean ? s.slice(i + 1, j) : renderInline(s, i + 1, j, env)) + '</em>';
+        if (plainStart < i) mdCopyFast(buf, plainStart, i);
+        mdWriteAscii('<em>');
+        if (clean) mdCopyFast(buf, i + 1, j);
+        else renderInlineToArena(buf, i + 1, j, env);
+        mdWriteAscii('</em>');
         i = j + 1;
         plainStart = i;
       } else {
@@ -563,12 +974,11 @@ function renderInline(s, from, to, env) {
       let k = -1;
       let cleanText = true;
       for (let x = i + 1; x < to; x++) {
-        const ch = s.charCodeAt(x);
-        if (ch < 128 && INLINE_SPECIAL[ch] !== 0) {
+        const ch = buf[x];
+        if (sp[ch] !== 0) {
           cleanText = false;
           if (ch === 92 && x + 1 < to) {
-            const n = s.charCodeAt(x + 1);
-            if (n < 128 && ESCAPABLE[n] !== 0) {
+            if (ESCAPABLE[buf[x + 1]] !== 0) {
               x++;
               continue;
             }
@@ -579,24 +989,36 @@ function renderInline(s, from, to, env) {
           break;
         }
       }
-      if (k !== -1 && k + 1 < to && s.charCodeAt(k + 1) === 40) {
+      if (k !== -1 && k + 1 < to && buf[k + 1] === 40) {
         let m = -1;
         let hasWs = false;
         for (let x = k + 2; x < to; x++) {
-          const ch = s.charCodeAt(x);
+          const ch = buf[x];
           if (ch === 41) {
             m = x;
             break;
           }
-          if (ch < 128 ? WS_ASCII[ch] !== 0 : isUnicodeSpace(ch)) {
-            hasWs = true;
-            break;
+          if (ch < 128) {
+            if (WS_ASCII[ch] !== 0) {
+              hasWs = true;
+              break;
+            }
+          } else {
+            if (unicodeSpaceByteLen(buf, x, to) !== 0) {
+              hasWs = true;
+              break;
+            }
           }
         }
         if (m > k + 2 && !hasWs) {
-          if (plainStart < i) out += s.slice(plainStart, i);
-          const target = s.slice(k + 2, m);
-          out += '<a href="' + env.escapedLink(target) + '">' + (cleanText ? s.slice(i + 1, k) : renderInline(s, i + 1, k, env)) + '</a>';
+          if (plainStart < i) mdCopyFast(buf, plainStart, i);
+          mdWriteAscii('<a href="');
+          env.writeEscapedLink(buf, k + 2, m);
+          ensureMd((to - i) * 8 + 256);
+          mdWriteAscii('">');
+          if (cleanText) mdCopyFast(buf, i + 1, k);
+          else renderInlineToArena(buf, i + 1, k, env);
+          mdWriteAscii('</a>');
           i = m + 1;
           plainStart = i;
           continue;
@@ -605,64 +1027,73 @@ function renderInline(s, from, to, env) {
       i++;
       continue;
     }
-    if (plainStart < i) out += s.slice(plainStart, i);
-    out += c === 38 ? '&amp;' : c === 60 ? '&lt;' : c === 62 ? '&gt;' : c === 34 ? '&quot;' : '&#39;';
+    if (plainStart < i) mdCopyFast(buf, plainStart, i);
+    if (c === 38) mdWriteAscii('&amp;');
+    else if (c === 60) mdWriteAscii('&lt;');
+    else if (c === 62) mdWriteAscii('&gt;');
+    else if (c === 34) mdWriteAscii('&quot;');
+    else mdWriteAscii('&#39;');
     i++;
     plainStart = i;
   }
-  if (plainStart === from) return s.slice(from, to);
-  if (plainStart < to) out += s.slice(plainStart, to);
-  return out;
+  if (plainStart < to) mdCopyFast(buf, plainStart, to);
 }
 
-function trimLineSlice(src, start, end) {
+let _tStart = 0;
+let _tEnd = 0;
+function trimRange(buf, start, end) {
   while (start < end) {
-    const c = src.charCodeAt(start);
+    const c = buf[start];
     if (c === 32 || c === 9) start++;
     else break;
   }
   while (end > start) {
-    const c = src.charCodeAt(end - 1);
+    const c = buf[end - 1];
     if (c === 32 || c === 9) end--;
     else break;
   }
-  return src.slice(start, end);
+  _tStart = start;
+  _tEnd = end;
 }
 
-function isBlankRange(src, start, end) {
+function isBlankRange(buf, start, end) {
   for (let i = start; i < end; i++) {
-    const c = src.charCodeAt(i);
+    const c = buf[i];
     if (c !== 32 && c !== 9) return false;
   }
   return true;
 }
 
-function parseFenceOpen(src, start, end) {
-  if (end - start < 3 || src.charCodeAt(start) !== 96 || src.charCodeAt(start + 1) !== 96 || src.charCodeAt(start + 2) !== 96) {
-    return null;
+let _langStart = 0;
+let _langEnd = 0;
+function parseFenceOpen(buf, start, end) {
+  if (end - start < 3 || buf[start] !== 96 || buf[start + 1] !== 96 || buf[start + 2] !== 96) {
+    return false;
   }
   let p = start + 3;
   while (p < end) {
-    const c = src.charCodeAt(p);
+    const c = buf[p];
     if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) {
       p++;
     } else break;
   }
   const langEnd = p;
   while (p < end) {
-    const c = src.charCodeAt(p);
-    if (c !== 32 && c !== 9) return null;
+    const c = buf[p];
+    if (c !== 32 && c !== 9) return false;
     p++;
   }
-  return src.slice(start + 3, langEnd);
+  _langStart = start + 3;
+  _langEnd = langEnd;
+  return true;
 }
 
-function isFenceClose(src, start, end) {
-  if (end - start < 3 || src.charCodeAt(start) !== 96 || src.charCodeAt(start + 1) !== 96 || src.charCodeAt(start + 2) !== 96) {
+function isFenceClose(buf, start, end) {
+  if (end - start < 3 || buf[start] !== 96 || buf[start + 1] !== 96 || buf[start + 2] !== 96) {
     return false;
   }
   for (let p = start + 3; p < end; p++) {
-    const c = src.charCodeAt(p);
+    const c = buf[p];
     if (c !== 32 && c !== 9) return false;
   }
   return true;
@@ -671,23 +1102,23 @@ function isFenceClose(src, start, end) {
 let _hDepth = 0;
 let _hStart = 0;
 let _hEnd = 0;
-function matchHeading(src, start, end) {
-  if (start >= end || src.charCodeAt(start) !== 35) return false;
+function matchHeading(buf, start, end) {
+  if (start >= end || buf[start] !== 35) return false;
   let depth = 1;
-  while (depth <= 6 && start + depth < end && src.charCodeAt(start + depth) === 35) depth++;
+  while (depth <= 6 && start + depth < end && buf[start + depth] === 35) depth++;
   if (depth > 6) return false;
   let p = start + depth;
   if (p >= end) return false;
-  const firstWs = src.charCodeAt(p);
+  const firstWs = buf[p];
   if (firstWs !== 32 && firstWs !== 9) return false;
   while (p < end) {
-    const c = src.charCodeAt(p);
+    const c = buf[p];
     if (c === 32 || c === 9) p++;
     else break;
   }
   let tEnd = end;
   while (tEnd > p) {
-    const c = src.charCodeAt(tEnd - 1);
+    const c = buf[tEnd - 1];
     if (c === 32 || c === 9) tEnd--;
     else break;
   }
@@ -698,269 +1129,379 @@ function matchHeading(src, start, end) {
   return true;
 }
 
-function isHr(src, start, end) {
+function isHr(buf, start, end) {
   if (end - start < 3) return false;
-  const c = src.charCodeAt(start);
+  const c = buf[start];
   if (c !== 45 && c !== 42) return false;
-  if (src.charCodeAt(start + 1) !== c || src.charCodeAt(start + 2) !== c) return false;
+  if (buf[start + 1] !== c || buf[start + 2] !== c) return false;
   for (let p = start + 3; p < end; p++) {
-    const ch = src.charCodeAt(p);
+    const ch = buf[p];
     if (ch !== 32 && ch !== 9) return false;
   }
   return true;
 }
 
-function isContinued(src, start, end) {
-  if (end - start < 3 || src.charCodeAt(start) !== 32 || src.charCodeAt(start + 1) !== 32) return false;
+function isContinued(buf, start, end) {
+  if (end - start < 3 || buf[start] !== 32 || buf[start + 1] !== 32) return false;
   let p = start + 2;
-  while (p < end && src.charCodeAt(p) === 32) p++;
+  while (p < end && buf[p] === 32) p++;
   if (p >= end) return false;
-  const c = src.charCodeAt(p);
-  return !(c < 128 ? WS_ASCII[c] !== 0 : isUnicodeSpace(c));
+  const c = buf[p];
+  if (c < 128) return WS_ASCII[c] === 0;
+  return unicodeSpaceByteLen(buf, p, end) === 0;
 }
 
-function matchOrdered(src, start, end) {
+function matchOrdered(buf, start, end) {
   let p = start;
-  const maxD = Math.min(end, start + 9);
+  const maxD = end < start + 9 ? end : start + 9;
   while (p < maxD) {
-    const c = src.charCodeAt(p);
+    const c = buf[p];
     if (c >= 48 && c <= 57) p++;
     else break;
   }
   if (p === start || p + 1 >= end) return -1;
-  if (src.charCodeAt(p) !== 46 || src.charCodeAt(p + 1) !== 32) return -1;
+  if (buf[p] !== 46 || buf[p + 1] !== 32) return -1;
   return p + 2;
 }
 
-function renderMarkdown(src, startPos, env, slugify) {
-  const len = src.length;
+function scratchAppendTrimmed(scratchPos, buf, start, end) {
+  trimRange(buf, start, end);
+  const s = _tStart;
+  const e = _tEnd;
+  const len = e - s;
+  if (scratchPos + len + 1 > scratchArena.length) ensureScratch(scratchPos + len + 1);
+  if (len > 0) {
+    buf.copy(scratchArena, scratchPos, s, e);
+    scratchPos += len;
+  }
+  return scratchPos;
+}
+
+function renderMarkdownToArena(buf, startPos, len, env, slugifyBuf) {
+  const fLen = len - startPos;
+  ensureMd(fLen * 8 + 8192);
+  const htmlStart = mdPos;
   const ids = new Set();
   const toc = [];
-  let excerpt = null;
-  let html = '';
+  let excerptStart = -1;
+  let excerptEnd = -1;
 
   let pos = startPos;
   while (pos < len) {
-    const nl = src.indexOf('\n', pos);
-    const end = nl === -1 ? len : nl;
+    const end = findNl(buf, pos, len);
+    const hasNl = end < len;
+    const nextPos = hasNl ? end + 1 : len;
 
     if (pos === end) {
-      pos = nl === -1 ? len : nl + 1;
+      pos = nextPos;
       continue;
     }
 
-    const c0 = src.charCodeAt(pos);
-    if ((c0 === 32 || c0 === 9) && isBlankRange(src, pos, end)) {
-      pos = nl === -1 ? len : nl + 1;
+    const c0 = buf[pos];
+    if ((c0 === 32 || c0 === 9) && isBlankRange(buf, pos, end)) {
+      pos = nextPos;
       continue;
     }
 
     // Fence
-    if (c0 === 96) {
-      const lang = parseFenceOpen(src, pos, end);
-      if (lang !== null) {
-        const bodyStart = nl === -1 ? len + 1 : nl + 1;
-        pos = bodyStart;
-        let bodyEnd = bodyStart;
-        let hasLines = false;
-        let trailingNl = false;
-        let closed = false;
-        while (pos <= len) {
-          if (pos === len) {
-            if (len > startPos && src.charCodeAt(len - 1) === 10) {
-              trailingNl = true;
-            }
-            pos = len + 1;
-            break;
-          }
-          const fnl = src.indexOf('\n', pos);
-          const fend = fnl === -1 ? len : fnl;
-          if (src.charCodeAt(pos) === 96 && isFenceClose(src, pos, fend)) {
-            pos = fnl === -1 ? len : fnl + 1;
-            closed = true;
-            break;
-          }
-          hasLines = true;
-          bodyEnd = fend;
-          pos = fnl === -1 ? len + 1 : fnl + 1;
+    if (c0 === 96 && parseFenceOpen(buf, pos, end)) {
+      const lStart = _langStart;
+      const lEnd = _langEnd;
+      const bodyStart = hasNl ? end + 1 : len + 1;
+      pos = bodyStart;
+      let bodyEnd = bodyStart;
+      let hasLines = false;
+      let trailingNl = false;
+      let closed = false;
+      while (pos <= len) {
+        if (pos === len) {
+          if (len > startPos && buf[len - 1] === 10) trailingNl = true;
+          pos = len + 1;
+          break;
         }
-        if (closed && pos > len) pos = len;
-        let bodyHtml = '';
-        if (hasLines) {
-          bodyHtml = escapeHtmlRange(src, bodyStart, bodyEnd) + '\n';
+        const fend = findNl(buf, pos, len);
+        const fHasNl = fend < len;
+        if (buf[pos] === 96 && isFenceClose(buf, pos, fend)) {
+          pos = fHasNl ? fend + 1 : len;
+          closed = true;
+          break;
         }
-        if (trailingNl) bodyHtml += '\n';
-        const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
-        html += `<pre><code${cls}>${bodyHtml}</code></pre>\n`;
-        continue;
+        hasLines = true;
+        bodyEnd = fend;
+        pos = fHasNl ? fend + 1 : len + 1;
       }
+      if (closed && pos > len) pos = len;
+      mdWriteAscii('<pre><code');
+      if (lEnd > lStart) {
+        mdWriteAscii(' class="language-');
+        mdWriteEscapeSpan(buf, lStart, lEnd);
+        mdWriteAscii('"');
+      }
+      mdWriteAscii('>');
+      if (hasLines) {
+        mdWriteEscapeSpan(buf, bodyStart, bodyEnd);
+        if (mdPos + 1 > mdArena.length) ensureMd(1);
+        mdArena[mdPos++] = 10;
+      }
+      if (trailingNl) {
+        if (mdPos + 1 > mdArena.length) ensureMd(1);
+        mdArena[mdPos++] = 10;
+      }
+      mdWriteAscii('</code></pre>\n');
+      continue;
     }
 
     // Heading
-    if (c0 === 35 && matchHeading(src, pos, end)) {
+    if (c0 === 35 && matchHeading(buf, pos, end)) {
       const depth = _hDepth;
       const hStart = _hStart;
       const hEnd = _hEnd;
-      const id = uniqueSlug(slugify(src.slice(hStart, hEnd)), ids);
-      const inlineHtml = renderInline(src, hStart, hEnd, env);
-      html += `<h${depth} id="${id}">${inlineHtml}</h${depth}>\n`;
+      const id = uniqueSlug(slugifyBuf(buf, hStart, hEnd), ids);
+      if (mdPos + 12 > mdArena.length) ensureMd(12);
+      mdArena[mdPos++] = 60; // <
+      mdArena[mdPos++] = 104; // h
+      mdArena[mdPos++] = 48 + depth;
+      mdWriteAscii(' id="');
+      mdWriteAscii(id);
+      mdWriteAscii('">');
+      const hHtmlStart = mdPos;
+      renderInlineToArena(buf, hStart, hEnd, env);
+      const hHtmlEnd = mdPos;
+      if (mdPos + 6 > mdArena.length) ensureMd(6);
+      mdArena[mdPos++] = 60; // <
+      mdArena[mdPos++] = 47; // /
+      mdArena[mdPos++] = 104; // h
+      mdArena[mdPos++] = 48 + depth;
+      mdArena[mdPos++] = 62; // >
+      mdArena[mdPos++] = 10; // \n
       if (depth === 2 || depth === 3) {
-        toc.push({ level: depth, id, html: inlineHtml });
+        toc.push({ level: depth, id, htmlStart: hHtmlStart, htmlEnd: hHtmlEnd });
       }
-      pos = nl === -1 ? len : nl + 1;
+      pos = nextPos;
       continue;
     }
 
     // HR
-    if ((c0 === 45 || c0 === 42) && isHr(src, pos, end)) {
-      html += '<hr>\n';
-      pos = nl === -1 ? len : nl + 1;
+    if ((c0 === 45 || c0 === 42) && isHr(buf, pos, end)) {
+      mdWriteAscii('<hr>\n');
+      pos = nextPos;
       continue;
     }
 
     // Blockquote
     if (c0 === 62) {
-      const qLines = [];
-      while (pos < len && src.charCodeAt(pos) === 62) {
-        const qnl = src.indexOf('\n', pos);
-        const qend = qnl === -1 ? len : qnl;
+      let lineCount = 0;
+      let singleStart = 0;
+      let singleEnd = 0;
+      let scPos = 0;
+      while (pos < len && buf[pos] === 62) {
+        const qend = findNl(buf, pos, len);
+        const qHasNl = qend < len;
         let qStart = pos + 1;
-        if (qStart < qend && src.charCodeAt(qStart) === 32) qStart++;
-        const trimmed = trimLineSlice(src, qStart, qend);
-        if (trimmed !== '') qLines.push(trimmed);
-        pos = qnl === -1 ? len : qnl + 1;
+        if (qStart < qend && buf[qStart] === 32) qStart++;
+        trimRange(buf, qStart, qend);
+        const curS = _tStart;
+        const curE = _tEnd;
+        if (curE > curS) {
+          if (lineCount === 0) {
+            singleStart = curS;
+            singleEnd = curE;
+            lineCount = 1;
+          } else {
+            if (lineCount === 1) {
+              scPos = scratchAppendTrimmed(0, buf, singleStart, singleEnd);
+            }
+            if (scPos + 1 > scratchArena.length) ensureScratch(scPos + 1);
+            scratchArena[scPos++] = 10;
+            scPos = scratchAppendTrimmed(scPos, buf, curS, curE);
+            lineCount++;
+          }
+        }
+        pos = qHasNl ? qend + 1 : len;
       }
-      if (qLines.length === 0) {
-        html += '<blockquote>\n</blockquote>\n';
-      } else if (qLines.length === 1) {
-        const q = qLines[0];
-        html += `<blockquote>\n<p>${renderInline(q, 0, q.length, env)}</p>\n</blockquote>\n`;
+      if (lineCount === 0) {
+        mdWriteAscii('<blockquote>\n</blockquote>\n');
+      } else if (lineCount === 1) {
+        mdWriteAscii('<blockquote>\n<p>');
+        renderInlineToArena(buf, singleStart, singleEnd, env);
+        mdWriteAscii('</p>\n</blockquote>\n');
       } else {
-        const q = qLines.join('\n');
-        html += `<blockquote>\n<p>${renderInline(q, 0, q.length, env)}</p>\n</blockquote>\n`;
+        mdWriteAscii('<blockquote>\n<p>');
+        renderInlineToArena(scratchArena, 0, scPos, env);
+        mdWriteAscii('</p>\n</blockquote>\n');
       }
       continue;
     }
 
     // Bullet list
-    if ((c0 === 45 || c0 === 42) && pos + 1 < end && src.charCodeAt(pos + 1) === 32) {
-      let listHtml = '<ul>\n';
-      let curItem = trimLineSlice(src, pos + 2, end);
-      pos = nl === -1 ? len : nl + 1;
+    if ((c0 === 45 || c0 === 42) && pos + 1 < end && buf[pos + 1] === 32) {
+      mdWriteAscii('<ul>\n');
+      trimRange(buf, pos + 2, end);
+      let itemStart = _tStart;
+      let itemEnd = _tEnd;
+      let itemInScratch = false;
+      let scPos = 0;
+      pos = nextPos;
       while (pos < len) {
-        const lnl = src.indexOf('\n', pos);
-        const lend = lnl === -1 ? len : lnl;
-        const lc0 = pos < lend ? src.charCodeAt(pos) : -1;
-        if ((lc0 === 45 || lc0 === 42) && pos + 1 < lend && src.charCodeAt(pos + 1) === 32) {
-          listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n`;
-          curItem = trimLineSlice(src, pos + 2, lend);
-          pos = lnl === -1 ? len : lnl + 1;
-        } else if (lc0 === 32 && isContinued(src, pos, lend)) {
-          curItem += '\n' + trimLineSlice(src, pos, lend);
-          pos = lnl === -1 ? len : lnl + 1;
+        const lend = findNl(buf, pos, len);
+        const lHasNl = lend < len;
+        const lc0 = pos < lend ? buf[pos] : -1;
+        if ((lc0 === 45 || lc0 === 42) && pos + 1 < lend && buf[pos + 1] === 32) {
+          mdWriteAscii('<li>');
+          if (itemInScratch) renderInlineToArena(scratchArena, 0, scPos, env);
+          else renderInlineToArena(buf, itemStart, itemEnd, env);
+          mdWriteAscii('</li>\n');
+          trimRange(buf, pos + 2, lend);
+          itemStart = _tStart;
+          itemEnd = _tEnd;
+          itemInScratch = false;
+          pos = lHasNl ? lend + 1 : len;
+        } else if (lc0 === 32 && isContinued(buf, pos, lend)) {
+          if (!itemInScratch) {
+            scPos = itemEnd - itemStart;
+            if (scPos > scratchArena.length) ensureScratch(scPos);
+            if (scPos > 0) buf.copy(scratchArena, 0, itemStart, itemEnd);
+            itemInScratch = true;
+          }
+          if (scPos + 1 > scratchArena.length) ensureScratch(scPos + 1);
+          scratchArena[scPos++] = 10;
+          scPos = scratchAppendTrimmed(scPos, buf, pos, lend);
+          pos = lHasNl ? lend + 1 : len;
         } else {
           break;
         }
       }
-      listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n</ul>\n`;
-      html += listHtml;
+      mdWriteAscii('<li>');
+      if (itemInScratch) renderInlineToArena(scratchArena, 0, scPos, env);
+      else renderInlineToArena(buf, itemStart, itemEnd, env);
+      mdWriteAscii('</li>\n</ul>\n');
       continue;
     }
 
     // Ordered list
     if (c0 >= 48 && c0 <= 57) {
-      const oStart = matchOrdered(src, pos, end);
+      const oStart = matchOrdered(buf, pos, end);
       if (oStart !== -1) {
-        const startNum = Number(src.slice(pos, oStart - 2));
-        let listHtml = startNum !== 1 ? `<ol start="${startNum}">\n` : '<ol>\n';
-        let curItem = trimLineSlice(src, oStart, end);
-        pos = nl === -1 ? len : nl + 1;
+        let startNum = 0;
+        for (let k = pos; k < oStart - 2; k++) startNum = startNum * 10 + (buf[k] - 48);
+        if (startNum !== 1) {
+          mdWriteAscii('<ol start="');
+          mdWriteUint(startNum);
+          mdWriteAscii('">\n');
+        } else {
+          mdWriteAscii('<ol>\n');
+        }
+        trimRange(buf, oStart, end);
+        let itemStart = _tStart;
+        let itemEnd = _tEnd;
+        let itemInScratch = false;
+        let scPos = 0;
+        pos = nextPos;
         while (pos < len) {
-          const lnl = src.indexOf('\n', pos);
-          const lend = lnl === -1 ? len : lnl;
-          const lc0 = pos < lend ? src.charCodeAt(pos) : -1;
+          const lend = findNl(buf, pos, len);
+          const lHasNl = lend < len;
+          const lc0 = pos < lend ? buf[pos] : -1;
           if (lc0 >= 48 && lc0 <= 57) {
-            const mo = matchOrdered(src, pos, lend);
+            const mo = matchOrdered(buf, pos, lend);
             if (mo !== -1) {
-              listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n`;
-              curItem = trimLineSlice(src, mo, lend);
-              pos = lnl === -1 ? len : lnl + 1;
+              mdWriteAscii('<li>');
+              if (itemInScratch) renderInlineToArena(scratchArena, 0, scPos, env);
+              else renderInlineToArena(buf, itemStart, itemEnd, env);
+              mdWriteAscii('</li>\n');
+              trimRange(buf, mo, lend);
+              itemStart = _tStart;
+              itemEnd = _tEnd;
+              itemInScratch = false;
+              pos = lHasNl ? lend + 1 : len;
               continue;
             }
           }
-          if (lc0 === 32 && isContinued(src, pos, lend)) {
-            curItem += '\n' + trimLineSlice(src, pos, lend);
-            pos = lnl === -1 ? len : lnl + 1;
+          if (lc0 === 32 && isContinued(buf, pos, lend)) {
+            if (!itemInScratch) {
+              scPos = itemEnd - itemStart;
+              if (scPos > scratchArena.length) ensureScratch(scPos);
+              if (scPos > 0) buf.copy(scratchArena, 0, itemStart, itemEnd);
+              itemInScratch = true;
+            }
+            if (scPos + 1 > scratchArena.length) ensureScratch(scPos + 1);
+            scratchArena[scPos++] = 10;
+            scPos = scratchAppendTrimmed(scPos, buf, pos, lend);
+            pos = lHasNl ? lend + 1 : len;
           } else {
             break;
           }
         }
-        listHtml += `<li>${renderInline(curItem, 0, curItem.length, env)}</li>\n</ol>\n`;
-        html += listHtml;
+        mdWriteAscii('<li>');
+        if (itemInScratch) renderInlineToArena(scratchArena, 0, scPos, env);
+        else renderInlineToArena(buf, itemStart, itemEnd, env);
+        mdWriteAscii('</li>\n</ol>\n');
         continue;
       }
     }
 
-    // Paragraph (contiguous zero-copy fast path + 1-lookup paragraph stop filter)
+    // Paragraph (contiguous zero-copy fast path + scratch fallback if trimmed multi-line)
     let pStart = pos;
     let pEnd = end;
-    while (pStart < pEnd) {
-      const ch = src.charCodeAt(pStart);
-      if (ch === 32 || ch === 9) pStart++;
-      else break;
-    }
-    while (pEnd > pStart) {
-      const ch = src.charCodeAt(pEnd - 1);
-      if (ch === 32 || ch === 9) pEnd--;
-      else break;
-    }
+    while (pStart < pEnd && (buf[pStart] === 32 || buf[pStart] === 9)) pStart++;
+    while (pEnd > pStart && (buf[pEnd - 1] === 32 || buf[pEnd - 1] === 9)) pEnd--;
     const contigStart = pStart;
     let contigEnd = pEnd;
-    let extraLines = null;
+    let useScratch = false;
+    let scPos = 0;
     const firstHadTrailing = pEnd < end;
-    pos = nl === -1 ? len : nl + 1;
+    pos = nextPos;
 
     while (pos < len) {
-      const pnl = src.indexOf('\n', pos);
-      const pend = pnl === -1 ? len : pnl;
+      const pend = findNl(buf, pos, len);
+      const pHasNl = pend < len;
       if (pos === pend) break;
-      const pc0 = src.charCodeAt(pos);
+      const pc0 = buf[pos];
       if (pc0 < 128 && PARA_STOP_FIRST[pc0] !== 0) {
-        if ((pc0 === 32 || pc0 === 9) && isBlankRange(src, pos, pend)) break;
-        if (pc0 === 96 && parseFenceOpen(src, pos, pend) !== null) break;
-        if (pc0 === 35 && matchHeading(src, pos, pend)) break;
-        if ((pc0 === 45 || pc0 === 42) && isHr(src, pos, pend)) break;
+        if ((pc0 === 32 || pc0 === 9) && isBlankRange(buf, pos, pend)) break;
+        if (pc0 === 96 && parseFenceOpen(buf, pos, pend)) break;
+        if (pc0 === 35 && matchHeading(buf, pos, pend)) break;
+        if ((pc0 === 45 || pc0 === 42) && isHr(buf, pos, pend)) break;
       }
 
-      const pcLast = src.charCodeAt(pend - 1);
+      const pcLast = buf[pend - 1];
       const needsTrim = pc0 === 32 || pc0 === 9 || pcLast === 32 || pcLast === 9;
-      if (extraLines === null) {
+      if (!useScratch) {
         if (!firstHadTrailing && !needsTrim) {
           contigEnd = pend;
-          pos = pnl === -1 ? len : pnl + 1;
+          pos = pHasNl ? pend + 1 : len;
           continue;
         }
-        extraLines = [src.slice(contigStart, contigEnd)];
+        const firstLen = contigEnd - contigStart;
+        if (firstLen > scratchArena.length) ensureScratch(firstLen);
+        if (firstLen > 0) buf.copy(scratchArena, 0, contigStart, contigEnd);
+        scPos = firstLen;
+        useScratch = true;
       }
-      extraLines.push(needsTrim ? trimLineSlice(src, pos, pend) : src.slice(pos, pend));
-      pos = pnl === -1 ? len : pnl + 1;
+      if (scPos + 1 > scratchArena.length) ensureScratch(scPos + 1);
+      scratchArena[scPos++] = 10;
+      scPos = scratchAppendTrimmed(scPos, buf, pos, pend);
+      pos = pHasNl ? pend + 1 : len;
     }
 
-    let inlineHtml;
-    if (extraLines === null) {
-      inlineHtml = renderInline(src, contigStart, contigEnd, env);
+    mdWriteAscii('<p>');
+    const inlineStart = mdPos;
+    if (!useScratch) {
+      renderInlineToArena(buf, contigStart, contigEnd, env);
     } else {
-      const pText = extraLines.join('\n');
-      inlineHtml = renderInline(pText, 0, pText.length, env);
+      renderInlineToArena(scratchArena, 0, scPos, env);
     }
-    if (excerpt === null) excerpt = inlineHtml;
-    html += `<p>${inlineHtml}</p>\n`;
+    const inlineEnd = mdPos;
+    mdWriteAscii('</p>\n');
+    if (excerptStart === -1) {
+      excerptStart = inlineStart;
+      excerptEnd = inlineEnd;
+    }
   }
 
-  return { html, toc, excerpt: excerpt ?? '' };
+  return { htmlStart, htmlEnd: mdPos, toc, excerptStart, excerptEnd };
 }
 
-// ---------------------------------------------------------------- Templates
+// ---------------------------------------------------------------- Templates & Bytecode VM
 
 const PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 const FOR_RE = /^for ([A-Za-z_][A-Za-z0-9_]*) in (\S+)$/;
@@ -1109,7 +1650,14 @@ function resolveStaticValue(obj, path, startIdx) {
   return v;
 }
 
-// Known root presence per render role for dead-branch elimination
+// Compile-time path lookup helper (object chain, span awareness)
+// Path descriptors in VM:
+// srcKind: 0 = root property (`_r[rootKey]`), 1 = loop binding slot (`loopSlots[slot]`), 2 = `loop` object (`activeLoopTop`)
+// spanKind: 0 = none, 1 = mdArena content (`htmlStart/htmlEnd`), 2 = mdArena excerpt (`excerptStart/excerptEnd`)
+const SAFE_STR_PROPS = new Set(['date', 'date_long', 'slug']);
+const SAFE_URL_PROPS = new Set(['url', 'newer_url', 'older_url']);
+const NUM_PROPS = new Set(['reading_minutes', 'count', 'number', 'total']);
+
 const ROLE_ABSENT = {
   page: new Set(['tag', 'posts', 'pager']),
   index: new Set(['page', 'tag']),
@@ -1127,12 +1675,41 @@ const ROLE_PRESENT_OBJ = {
   site: new Set(),
 };
 
-function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
-  const compiled = new Map();
-  const staticPartials = new Map();
-  const cardCache = new Map();
+// VM Opcodes
+const OP_BYTES = 1;     // [off, len] -> copy from tplArena
+const OP_VAR_ESC = 2;   // [pathId]
+const OP_VAR_RAW = 3;   // [pathId]
+const OP_IF = 4;        // [pathId, notFlag, elsePc]
+const OP_JUMP = 5;      // [targetPc]
+const OP_FOR_INIT = 6;  // [pathId, slotIdx, endPc]
+const OP_FOR_NEXT = 7;  // [slotIdx, bodyPc]
+const OP_CARD_LOOP = 8; // [pathId, cardTplIdx]
+const OP_LOOP_PROP = 9; // [propKind] 0=index,1=first,2=last,3=length
+
+// Special sentinel returned by path resolver when value lives in mdArena
+const SPAN_SENTINEL = {};
+let _spanStart = 0;
+let _spanEnd = 0;
+
+function createTemplateEngine(templatesMap, siteGlobals, baseSafe, totalPosts) {
+  tplPos = 0;
+  cardPos = 0;
+
+  const compiledPrograms = new Map();
+  const staticPartials = new Map(); // pKey -> { off, len } inside tplArena
   const freeVarsCache = new Map();
-  const cardVars = { site: siteGlobals.site, tags: siteGlobals.tags, recent: siteGlobals.recent, p: null };
+  const cardPrograms = []; // cardTplKey -> { idx, prog }
+  const cardProgByName = new Map();
+  // Per-post cached card spans [start, end] per cardTplIdx (lazy)
+  const cardStarts = [];
+  const cardEnds = [];
+
+  const loopElem = new Array(16);
+  const loopArr = new Array(16);
+  const loopK = new Int32Array(16);
+  const loopLen = new Int32Array(16);
+  const activeLoopStack = new Int32Array(16);
+  let activeLoopTop = -1;
 
   function getFreeVars(name, depth) {
     const k = `${name}@${depth}`;
@@ -1146,25 +1723,17 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
     return s;
   }
 
-  function cardRender(p, incName, incDepth) {
-    let byName = cardCache.get(incName);
-    if (byName === undefined) {
-      byName = new Map();
-      cardCache.set(incName, byName);
-    }
-    let html = byName.get(p);
-    if (html === undefined) {
-      const subFn = compileEntry(incName, incDepth, 'card');
-      cardVars.p = p;
-      html = subFn(cardVars);
-      byName.set(p, html);
-    }
-    return html;
+  function isSafeNoEscapePath(path) {
+    if (path.length < 2) return false;
+    const last = path[path.length - 1];
+    if (SAFE_STR_PROPS.has(last) || NUM_PROPS.has(last)) return true;
+    if (baseSafe && SAFE_URL_PROPS.has(last)) return true;
+    return false;
   }
 
   function compileEntry(name, baseDepth, role) {
     const cacheKey = `${name}@${baseDepth}@${role}`;
-    const cached = compiled.get(cacheKey);
+    const cached = compiledPrograms.get(cacheKey);
     if (cached !== undefined) return cached;
     const ast = templatesMap.get(name);
     if (ast === undefined) return null;
@@ -1172,14 +1741,35 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
     const absentRoots = ROLE_ABSENT[role];
     const presentRoots = ROLE_PRESENT_OBJ[role];
 
-    let tmpId = 0;
-    const usedTmps = [];
-    const trackedTmp = (p = '_t') => {
-      const t = `${p}${tmpId++}`;
-      usedTmps.push(t);
-      return t;
+    const code = [];
+    const paths = [];
+    let nextSlot = 0;
+
+    let textRunStart = -1; // inside tplArena
+    const startTextRun = () => {
+      if (textRunStart === -1) textRunStart = tplPos;
     };
-    const lines = ['const _o = [];'];
+    const appendTextStr = (s) => {
+      if (s === '') return;
+      startTextRun();
+      const len = s.length;
+      if (tplPos + len * 3 > tplArena.length) ensureTpl(len * 3);
+      tplPos += tplArena.utf8Write(s, tplPos);
+    };
+    const appendTplBytes = (off, len) => {
+      if (len === 0) return;
+      startTextRun();
+      if (tplPos + len > tplArena.length) ensureTpl(len);
+      tplArena.copy(tplArena, tplPos, off, off + len);
+      tplPos += len;
+    };
+    const flushText = () => {
+      if (textRunStart !== -1) {
+        const len = tplPos - textRunStart;
+        if (len > 0) code.push(OP_BYTES, textRunStart, len);
+        textRunStart = -1;
+      }
+    };
 
     function isShadowed(rootKey, bindings) {
       for (let i = bindings.length - 1; i >= 0; i--) {
@@ -1200,52 +1790,31 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
       return null;
     }
 
-    function isSafeNoEscapePath(path) {
-      if (path.length < 2) return false;
-      const last = path[path.length - 1];
-      if (SAFE_STR_PROPS.has(last) || NUM_PROPS.has(last)) return true;
-      if (baseSafe && SAFE_URL_PROPS.has(last)) return true;
-      return false;
-    }
-
-    function emitPath(path, bindings) {
+    function makePathDesc(path, bindings) {
       const rootKey = path[0];
-      let baseExpr = null;
+      let srcKind = 0; // root
+      let srcId = rootKey;
       for (let i = bindings.length - 1; i >= 0; i--) {
-        const b = bindings[i];
         if (rootKey === 'loop') {
-          if (path.length === 2) {
-            const prop = path[1];
-            if (prop === 'index') return `(${b.k} + 1)`;
-            if (prop === 'first') return `(${b.k} === 0)`;
-            if (prop === 'last') return `(${b.k} === ${b.len} - 1)`;
-            if (prop === 'length') return b.len;
-          }
-          baseExpr = `({ index: ${b.k} + 1, first: ${b.k} === 0, last: ${b.k} === ${b.len} - 1, length: ${b.len} })`;
+          srcKind = 2;
+          srcId = 0;
           break;
         }
-        if (rootKey === b.name) {
-          baseExpr = b.v;
+        if (bindings[i].name === rootKey) {
+          srcKind = 1; // slot
+          srcId = bindings[i].slot;
           break;
         }
       }
-      if (baseExpr === null) {
-        baseExpr = PROTO_PROPS.has(rootKey)
-          ? `(Object.hasOwn(_r, ${JSON.stringify(rootKey)}) ? _r[${JSON.stringify(rootKey)}] : undefined)`
-          : `_r.${rootKey}`;
+      const last = path[path.length - 1];
+      let spanKind = 0; // 1: htmlStart/End, 2: excerptStart/End
+      if (path.length >= 2) {
+        if (last === 'content' || last === 'html') spanKind = 1;
+        else if (last === 'excerpt') spanKind = 2;
       }
-      if (path.length === 1) return baseExpr;
-
-      let cur = baseExpr;
-      for (let i = 1; i < path.length; i++) {
-        const seg = path[i];
-        const tmp = trackedTmp();
-        const propAccess = PROTO_PROPS.has(seg)
-          ? `(Object.hasOwn(${tmp}, ${JSON.stringify(seg)}) ? ${tmp}[${JSON.stringify(seg)}] : undefined)`
-          : `${tmp}.${seg}`;
-        cur = `((${tmp} = ${cur}) !== null && typeof ${tmp} === "object" ? ${propAccess} : undefined)`;
-      }
-      return cur;
+      const id = paths.length;
+      paths.push({ srcKind, srcId, segs: path, len: path.length, spanKind });
+      return id;
     }
 
     function isSiteOnlyInclude(incName, depth, bindings) {
@@ -1259,48 +1828,48 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
       return true;
     }
 
-    let textBuf = '';
-    const exprParts = [];
-    const flushConcat = () => {
-      if (textBuf !== '') {
-        exprParts.push(JSON.stringify(textBuf));
-        textBuf = '';
+    function getCardIdx(incName, incDepth) {
+      const ck = `${incName}@${incDepth}`;
+      let idx = cardProgByName.get(ck);
+      if (idx === undefined) {
+        idx = cardPrograms.length;
+        cardProgByName.set(ck, idx);
+        const prog = compileEntry(incName, incDepth, 'card');
+        cardPrograms.push(prog);
+        cardStarts.push(new Int32Array(totalPosts).fill(-1));
+        cardEnds.push(new Int32Array(totalPosts));
       }
-      if (exprParts.length > 0) {
-        lines.push(`_o.push(${exprParts.join(' + ')});`);
-        exprParts.length = 0;
-      }
-    };
+      return idx;
+    }
 
     function emitNodes(nodes, bindings, depth) {
       for (let i = 0; i < nodes.length; i++) {
         const n = nodes[i];
         switch (n.kind) {
           case 'text':
-            textBuf += n.text;
+            appendTextStr(n.text);
             break;
           case 'var':
           case 'raw': {
             const st = tryStaticPath(n.path, bindings);
             if (st !== null) {
               const s = textOf(st.val);
-              textBuf += n.kind === 'var' ? escapeHtml(s) : s;
+              appendTextStr(n.kind === 'var' ? escapeHtml(s) : s);
               break;
             }
-            if (textBuf !== '') {
-              exprParts.push(JSON.stringify(textBuf));
-              textBuf = '';
+            flushText();
+            if (n.path[0] === 'loop' && n.path.length === 2 && bindings.length > 0) {
+              const p1 = n.path[1];
+              if (p1 === 'index') { code.push(OP_LOOP_PROP, 0); break; }
+              if (p1 === 'first') { code.push(OP_LOOP_PROP, 1); break; }
+              if (p1 === 'last') { code.push(OP_LOOP_PROP, 2); break; }
+              if (p1 === 'length') { code.push(OP_LOOP_PROP, 3); break; }
             }
-            const expr = emitPath(n.path, bindings);
-            if (n.path[0] === 'loop' && n.path.length === 2 && bindings.length > 0 && (n.path[1] === 'index' || n.path[1] === 'length')) {
-              exprParts.push(expr);
+            const pid = makePathDesc(n.path, bindings);
+            if (n.kind === 'raw' || isSafeNoEscapePath(n.path)) {
+              code.push(OP_VAR_RAW, pid);
             } else {
-              const tv = trackedTmp('_v');
-              if (n.kind === 'raw' || isSafeNoEscapePath(n.path)) {
-                exprParts.push(`(typeof (${tv} = ${expr}) === "string" ? ${tv} : _txt(${tv}))`);
-              } else {
-                exprParts.push(`(typeof (${tv} = ${expr}) === "string" ? _esc(${tv}) : _esc(_txt(${tv})))`);
-              }
+              code.push(OP_VAR_ESC, pid);
             }
             break;
           }
@@ -1310,40 +1879,36 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
               const v = st.val;
               const truth = Array.isArray(v) ? v.length > 0 : (v !== undefined && v !== null && v !== false && v !== '' && v !== 0);
               const branch = truth !== n.not ? n.then : n.else;
-              if (branch !== null) {
-                emitNodes(branch, bindings, depth);
-              }
+              if (branch !== null) emitNodes(branch, bindings, depth);
               break;
             }
             if (n.path.length === 1 && !isShadowed(n.path[0], bindings) && presentRoots.has(n.path[0])) {
               const branch = !n.not ? n.then : n.else;
-              if (branch !== null) {
-                emitNodes(branch, bindings, depth);
-              }
+              if (branch !== null) emitNodes(branch, bindings, depth);
               break;
             }
-            flushConcat();
-            const expr = emitPath(n.path, bindings);
-            const tv = trackedTmp('_v');
-            lines.push(`${tv} = ${expr};`);
-            const truth = `(Array.isArray(${tv}) ? ${tv}.length > 0 : (${tv} !== undefined && ${tv} !== null && ${tv} !== false && ${tv} !== "" && ${tv} !== 0))`;
-            lines.push(`if (${n.not ? `!${truth}` : truth}) {`);
+            flushText();
+            const pid = makePathDesc(n.path, bindings);
+            const ifIdx = code.length;
+            code.push(OP_IF, pid, n.not ? 1 : 0, 0);
             emitNodes(n.then, bindings, depth);
-            flushConcat();
+            flushText();
             if (n.else !== null) {
-              lines.push('} else {');
+              const jmpIdx = code.length;
+              code.push(OP_JUMP, 0);
+              code[ifIdx + 3] = code.length;
               emitNodes(n.else, bindings, depth);
-              flushConcat();
+              flushText();
+              code[jmpIdx + 1] = code.length;
+            } else {
+              code[ifIdx + 3] = code.length;
             }
-            lines.push('}');
             break;
           }
           case 'for': {
             const st = tryStaticPath(n.path, bindings);
-            if (st !== null && !Array.isArray(st.val)) {
-              break;
-            }
-            flushConcat();
+            if (st !== null && !Array.isArray(st.val)) break;
+            flushText();
             if (
               n.body.length === 1 && n.body[0].kind === 'include' &&
               n.name === 'p' && depth < INCLUDE_DEPTH
@@ -1359,37 +1924,24 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
                   }
                 }
                 if (onlyP && !isShadowed('site', bindings) && !isShadowed('tags', bindings) && !isShadowed('recent', bindings)) {
-                  const expr = emitPath(n.path, bindings);
-                  const arr = trackedTmp('_a');
-                  const lenVar = trackedTmp('_l');
-                  const kVar = trackedTmp('_k');
-                  lines.push(`${arr} = ${expr};`);
-                  lines.push(`if (Array.isArray(${arr})) {`);
-                  lines.push(`const ${lenVar} = ${arr}.length;`);
-                  lines.push(`for (let ${kVar} = 0; ${kVar} < ${lenVar}; ${kVar}++) {`);
-                  lines.push(`_o.push(_cardRender(${arr}[${kVar}], ${JSON.stringify(incName)}, ${depth + 1}));`);
-                  lines.push('}');
-                  lines.push('}');
+                  const pid = makePathDesc(n.path, bindings);
+                  const cIdx = getCardIdx(incName, depth + 1);
+                  code.push(OP_CARD_LOOP, pid, cIdx);
                   break;
                 }
               }
             }
-            const expr = emitPath(n.path, bindings);
-            const arr = trackedTmp('_a');
-            const lenVar = trackedTmp('_l');
-            const kVar = trackedTmp('_k');
-            const elemVar = trackedTmp('_e');
-            lines.push(`${arr} = ${expr};`);
-            lines.push(`if (Array.isArray(${arr})) {`);
-            lines.push(`const ${lenVar} = ${arr}.length;`);
-            lines.push(`for (let ${kVar} = 0; ${kVar} < ${lenVar}; ${kVar}++) {`);
-            lines.push(`const ${elemVar} = ${arr}[${kVar}];`);
-            bindings.push({ name: n.name, v: elemVar, k: kVar, len: lenVar });
+            const pid = makePathDesc(n.path, bindings);
+            const slot = nextSlot++;
+            const initIdx = code.length;
+            code.push(OP_FOR_INIT, pid, slot, 0);
+            const bodyPc = code.length;
+            bindings.push({ name: n.name, slot });
             emitNodes(n.body, bindings, depth);
-            flushConcat();
+            flushText();
             bindings.pop();
-            lines.push('}');
-            lines.push('}');
+            code.push(OP_FOR_NEXT, slot, bodyPc);
+            code[initIdx + 3] = code.length;
             break;
           }
           case 'include': {
@@ -1398,15 +1950,37 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
               const shadowed = isShadowed('site', bindings) || isShadowed('tags', bindings) || isShadowed('recent', bindings);
               if (!shadowed && isSiteOnlyInclude(n.name, depth + 1, bindings)) {
                 const pKey = `${n.name}@${depth + 1}@${role}`;
-                let rendered = staticPartials.get(pKey);
-                if (rendered === undefined) {
-                  const subFn = compileEntry(n.name, depth + 1, role);
-                  rendered = subFn(siteGlobals);
-                  staticPartials.set(pKey, rendered);
+                let slice = staticPartials.get(pKey);
+                if (slice === undefined) {
+                  flushText();
+                  const subProg = compileEntry(n.name, depth + 1, role);
+                  const savedBuf = vmBuf;
+                  const savedPos = vmPos;
+                  const savedIsCard = vmIsCard;
+                  const baseOut = outPos;
+                  vmBuf = outArena;
+                  vmPos = baseOut;
+                  vmIsCard = false;
+                  execProg(subProg, siteGlobals);
+                  const len = vmPos - baseOut;
+                  const tOff = tplPos;
+                  if (len > 0) {
+                    if (tplPos + len > tplArena.length) ensureTpl(len);
+                    outArena.copy(tplArena, tOff, baseOut, vmPos);
+                    tplPos += len;
+                    textRunStart = tOff;
+                  }
+                  outPos = baseOut;
+                  vmBuf = savedBuf;
+                  vmPos = savedPos;
+                  vmIsCard = savedIsCard;
+                  slice = { off: tOff, len };
+                  staticPartials.set(pKey, slice);
+                } else {
+                  appendTplBytes(slice.off, slice.len);
                 }
-                textBuf += rendered;
               } else {
-                flushConcat();
+                flushText();
                 emitNodes(inc, bindings, depth + 1);
               }
             }
@@ -1417,24 +1991,245 @@ function createTemplateRunner(templatesMap, siteGlobals, baseSafe) {
     }
 
     emitNodes(ast, [], baseDepth);
-    flushConcat();
-    const decl = usedTmps.length > 0 ? `let ${usedTmps.join(', ')};` : '';
-    const code = `${decl}\n${lines.join('\n')}\nreturn _o.join('');`;
-    const fn = new Function('_r', '_esc', '_txt', '_cardRender', code);
-    const wrapper = (vars) => fn(vars, escapeHtml, textOf, cardRender);
-    compiled.set(cacheKey, wrapper);
-    return wrapper;
+    flushText();
+    const prog = { ops: Int32Array.from(code), paths };
+    compiledPrograms.set(cacheKey, prog);
+    return prog;
   }
 
-  return compileEntry;
+  function resolvePath(desc, vars) {
+    const segs = desc.segs;
+    const slen = desc.len;
+    let cur;
+    if (desc.srcKind === 1) {
+      cur = loopElem[desc.srcId];
+    } else if (desc.srcKind === 0) {
+      const k = segs[0];
+      cur = Object.hasOwn(vars, k) ? vars[k] : undefined;
+    } else {
+      if (activeLoopTop < 0) cur = undefined;
+      else {
+        const s = activeLoopStack[activeLoopTop];
+        cur = {
+          index: loopK[s] + 1,
+          first: loopK[s] === 0,
+          last: loopK[s] === loopLen[s] - 1,
+          length: loopLen[s],
+        };
+      }
+    }
+
+    if (slen === 1) return cur;
+
+    const lastIdx = slen - 1;
+    for (let i = 1; i < lastIdx; i++) {
+      if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
+      const seg = segs[i];
+      cur = Object.hasOwn(cur, seg) ? cur[seg] : undefined;
+    }
+
+    if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
+    const lastSeg = segs[lastIdx];
+
+    if (desc.spanKind !== 0) {
+      if (desc.spanKind === 1) {
+        if (cur._htmlEnd !== undefined) {
+          _spanStart = cur._htmlStart;
+          _spanEnd = cur._htmlEnd;
+          return SPAN_SENTINEL;
+        }
+      } else {
+        if (cur._excerptEnd !== undefined) {
+          _spanStart = cur._excerptStart;
+          _spanEnd = cur._excerptEnd;
+          return SPAN_SENTINEL;
+        }
+      }
+    }
+
+    return Object.hasOwn(cur, lastSeg) ? cur[lastSeg] : undefined;
+  }
+
+  const cardVars = { site: siteGlobals.site, tags: siteGlobals.tags, recent: siteGlobals.recent, p: null };
+
+  function execProg(prog, vars) {
+    const ops = prog.ops;
+    const opsLen = ops.length;
+    const paths = prog.paths;
+    let pc = 0;
+
+    while (pc < opsLen) {
+      const op = ops[pc++];
+      switch (op) {
+        case OP_BYTES: {
+          const off = ops[pc++];
+          const len = ops[pc++];
+          vmWriteBytes(tplArena, off, off + len);
+          break;
+        }
+        case OP_VAR_ESC: {
+          const v = resolvePath(paths[ops[pc++]], vars);
+          if (v === SPAN_SENTINEL) {
+            if (_spanEnd > _spanStart) vmWriteEscapeSpan(mdArena, _spanStart, _spanEnd);
+          } else if (typeof v === 'string') {
+            vmWriteStrEscaped(v);
+          } else if (typeof v === 'number') {
+            vmWriteInt(v);
+          } else if (typeof v === 'boolean') {
+            vmWriteStrRaw(v ? 'true' : 'false');
+          } else if (Array.isArray(v)) {
+            vmWriteStrEscaped(textOf(v));
+          }
+          break;
+        }
+        case OP_VAR_RAW: {
+          const v = resolvePath(paths[ops[pc++]], vars);
+          if (v === SPAN_SENTINEL) {
+            if (_spanEnd > _spanStart) vmWriteBytes(mdArena, _spanStart, _spanEnd);
+          } else if (typeof v === 'string') {
+            vmWriteStrRaw(v);
+          } else if (typeof v === 'number') {
+            vmWriteInt(v);
+          } else if (typeof v === 'boolean') {
+            vmWriteStrRaw(v ? 'true' : 'false');
+          } else if (Array.isArray(v)) {
+            vmWriteStrRaw(textOf(v));
+          }
+          break;
+        }
+        case OP_LOOP_PROP: {
+          const pk = ops[pc++];
+          const s = activeLoopStack[activeLoopTop];
+          if (pk === 0) vmWriteInt(loopK[s] + 1);
+          else if (pk === 1) vmWriteStrRaw(loopK[s] === 0 ? 'true' : 'false');
+          else if (pk === 2) vmWriteStrRaw(loopK[s] === loopLen[s] - 1 ? 'true' : 'false');
+          else vmWriteInt(loopLen[s]);
+          break;
+        }
+        case OP_IF: {
+          const v = resolvePath(paths[ops[pc++]], vars);
+          const notF = ops[pc++] !== 0;
+          const elsePc = ops[pc++];
+          let truth;
+          if (v === SPAN_SENTINEL) {
+            truth = _spanEnd > _spanStart;
+          } else if (Array.isArray(v)) {
+            truth = v.length > 0;
+          } else {
+            truth = v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
+          }
+          if (truth === notF) pc = elsePc;
+          break;
+        }
+        case OP_JUMP: {
+          pc = ops[pc];
+          break;
+        }
+        case OP_FOR_INIT: {
+          const arr = resolvePath(paths[ops[pc++]], vars);
+          const slot = ops[pc++];
+          const endPc = ops[pc++];
+          if (!Array.isArray(arr) || arr.length === 0) {
+            pc = endPc;
+          } else {
+            loopArr[slot] = arr;
+            loopLen[slot] = arr.length;
+            loopK[slot] = 0;
+            loopElem[slot] = arr[0];
+            activeLoopStack[++activeLoopTop] = slot;
+          }
+          break;
+        }
+        case OP_FOR_NEXT: {
+          const slot = ops[pc++];
+          const bodyPc = ops[pc++];
+          const nk = loopK[slot] + 1;
+          if (nk < loopLen[slot]) {
+            loopK[slot] = nk;
+            loopElem[slot] = loopArr[slot][nk];
+            pc = bodyPc;
+          } else {
+            activeLoopTop--;
+          }
+          break;
+        }
+        case OP_CARD_LOOP: {
+          const arr = resolvePath(paths[ops[pc++]], vars);
+          const cIdx = ops[pc++];
+          if (Array.isArray(arr) && arr.length > 0) {
+            const cStarts = cardStarts[cIdx];
+            const cEnds = cardEnds[cIdx];
+            const cProg = cardPrograms[cIdx];
+            for (let j = 0; j < arr.length; j++) {
+              const p = arr[j];
+              const pId = p._postId;
+              if (pId !== undefined) {
+                let cs = cStarts[pId];
+                let ce;
+                if (cs === -1) {
+                  const savedBuf = vmBuf;
+                  const savedPos = vmPos;
+                  const savedIsCard = vmIsCard;
+                  const savedLoopTop = activeLoopTop;
+                  cs = cardPos;
+                  vmBuf = cardArena;
+                  vmPos = cs;
+                  vmIsCard = true;
+                  activeLoopTop = -1;
+                  cardVars.p = p;
+                  execProg(cProg, cardVars);
+                  ce = vmPos;
+                  cardPos = ce;
+                  vmBuf = savedBuf;
+                  vmPos = savedPos;
+                  vmIsCard = savedIsCard;
+                  activeLoopTop = savedLoopTop;
+                  cStarts[pId] = cs;
+                  cEnds[pId] = ce;
+                } else {
+                  ce = cEnds[pId];
+                }
+                vmWriteBytes(cardArena, cs, ce);
+              } else {
+                // Edge fallback if non-post array used in `for p in ...` + card include
+                const savedTop = activeLoopTop;
+                activeLoopTop = -1;
+                cardVars.p = p;
+                execProg(cProg, cardVars);
+                activeLoopTop = savedTop;
+              }
+            }
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  function renderToOutArena(prog, vars) {
+    const start = outPos;
+    vmBuf = outArena;
+    vmPos = start;
+    vmIsCard = false;
+    activeLoopTop = -1;
+    execProg(prog, vars);
+    outPos = vmPos;
+    return start;
+  }
+
+  return { compileEntry, renderToOutArena };
 }
 
-// ---------------------------------------------------------------- Build
+// ---------------------------------------------------------------- Site Builder Core
 
-export function run(input) {
-  const slugify = createSlugifier();
+function buildSiteCore(input, emitPage, emitStatic) {
+  srcPos = 0;
+  mdPos = 0;
+  outPos = 0;
 
-  // 1. Parse templates in code-unit order
+  const { slugifyStr, slugifyBuf } = createSlugifier();
+
+  // 1. Parse templates
   const templates = new Map();
   const report = [];
   const tplNames = Object.keys(input.templates).sort(byCodeUnits);
@@ -1448,7 +2243,7 @@ export function run(input) {
     }
   }
 
-  // 2. Sort files by path in code-unit order, split sources vs static files
+  // 2. Sort files by path in code-unit order, split & ingest .md into srcArena
   const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
   const sources = [];
   const statics = [];
@@ -1456,7 +2251,12 @@ export function run(input) {
     const f = files[i];
     if (f.path.endsWith('.md')) {
       const content = f.content.indexOf('\r') === -1 ? f.content : f.content.replace(/\r\n?/g, '\n');
-      sources.push({ path: f.path, text: content });
+      const sStart = srcPos;
+      ensureSrc(content.length * 3 + 16);
+      const nb = srcArena.utf8Write(content, sStart);
+      const sEnd = sStart + nb;
+      srcPos = sEnd;
+      sources.push({ path: f.path, sStart, sEnd });
     } else {
       statics.push(f);
     }
@@ -1466,7 +2266,7 @@ export function run(input) {
   const kept = [];
   for (let i = 0; i < sources.length; i++) {
     const s = sources[i];
-    const fm = parseFrontMatter(s.text);
+    const fm = parseFrontMatterBytes(srcArena, s.sStart, s.sEnd);
     if ('error' in fm) {
       report.push(`refused ${s.path}: ${fm.error}`);
       continue;
@@ -1510,20 +2310,32 @@ export function run(input) {
       tSet = new Set(dir === '' ? RESERVED : undefined);
       taken.set(dir, tSet);
     }
-    const slug = uniqueSlug(s.data.slug ?? slugify(s.data.title), tSet);
+    const slug = uniqueSlug(s.data.slug ?? slugifyStr(s.data.title), tSet);
     s.slug = slug;
     s.outDir = dir === '' ? slug : `${dir}/${slug}`;
     s.url = `${base}/${s.outDir}/`;
     bySource.set(s.path, s);
   }
 
-  // 5. Markdown
+  // 5. Markdown -> mdArena
   const staticPaths = new Set();
   for (let i = 0; i < statics.length; i++) staticPaths.add(statics[i].path);
   const broken = new Set();
   const resolveDirCaches = new Map();
   const extEscCache = new Map();
   const dirEscLinkCaches = new Map();
+
+  linkPos = 0;
+
+  const allocLinkSlice = (str) => {
+    const maxB = str.length * 3;
+    ensureLink(maxB);
+    const off = linkPos;
+    const nb = linkArena.utf8Write(str, off);
+    linkPos = off + nb;
+    ensureMd(nb + 4096);
+    return off * 65536 + nb;
+  };
 
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
@@ -1539,19 +2351,28 @@ export function run(input) {
       dirEscLinkCaches.set(dir, dirEscCache);
     }
     const env = {
-      escapedLink(target) {
-        const fast = dirEscCache.get(target);
-        if (fast !== undefined) return fast;
+      writeEscapedLink(buf, start, end) {
+        const target = buf.toString('utf8', start, end);
+        let packed = dirEscCache.get(target);
+        if (packed !== undefined) {
+          const lLen = packed & 65535;
+          const lOff = (packed - lLen) / 65536;
+          mdCopySpan(linkArena, lOff, lOff + lLen);
+          return;
+        }
 
         const c0 = target.charCodeAt(0);
         if (c0 === 47 || c0 === 35 || hasUrlScheme(target)) {
-          let esc = extEscCache.get(target);
-          if (esc === undefined) {
-            esc = escapeHtml(target);
-            extEscCache.set(target, esc);
+          let pExt = extEscCache.get(target);
+          if (pExt === undefined) {
+            pExt = allocLinkSlice(escapeHtml(target));
+            extEscCache.set(target, pExt);
           }
-          dirEscCache.set(target, esc);
-          return esc;
+          dirEscCache.set(target, pExt);
+          const lLen = pExt & 65535;
+          const lOff = (pExt - lLen) / 65536;
+          mdCopySpan(linkArena, lOff, lOff + lLen);
+          return;
         }
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
@@ -1571,24 +2392,41 @@ export function run(input) {
             dirCache.set(rel, resolvedUrl);
           }
           if (resolvedUrl !== null) {
-            const esc = escapeHtml(frag === '' ? resolvedUrl : `${resolvedUrl}${frag}`);
-            dirEscCache.set(target, esc);
-            return esc;
+            const pRel = allocLinkSlice(escapeHtml(frag === '' ? resolvedUrl : `${resolvedUrl}${frag}`));
+            dirEscCache.set(target, pRel);
+            const lLen = pRel & 65535;
+            const lOff = (pRel - lLen) / 65536;
+            mdCopySpan(linkArena, lOff, lOff + lLen);
+            return;
           }
         }
         broken.add(`broken-link ${s.path} -> ${target}`);
-        let esc = extEscCache.get(target);
-        if (esc === undefined) {
-          esc = escapeHtml(target);
-          extEscCache.set(target, esc);
+        let pExt = extEscCache.get(target);
+        if (pExt === undefined) {
+          pExt = allocLinkSlice(escapeHtml(target));
+          extEscCache.set(target, pExt);
         }
-        return esc;
+        const lLen = pExt & 65535;
+        const lOff = (pExt - lLen) / 65536;
+        mdCopySpan(linkArena, lOff, lOff + lLen);
       },
     };
-    const md = renderMarkdown(s.text, s.bodyStart, env, slugify);
-    s.html = md.html;
+    const md = renderMarkdownToArena(srcArena, s.bodyStart, s.sEnd, env, slugifyBuf);
+    s.htmlStart = md.htmlStart;
+    s.htmlEnd = md.htmlEnd;
     s.toc = md.toc;
-    s.excerpt = md.excerpt;
+    s.excerptStart = md.excerptStart === -1 ? 0 : md.excerptStart;
+    s.excerptEnd = md.excerptEnd === -1 ? 0 : md.excerptEnd;
+  }
+
+  // Wrap ToC items with _htmlStart/_htmlEnd for uniform resolvePath span access
+  for (let i = 0; i < kept.length; i++) {
+    const toc = kept[i].toc;
+    for (let j = 0; j < toc.length; j++) {
+      const h = toc[j];
+      h._htmlStart = h.htmlStart;
+      h._htmlEnd = h.htmlEnd;
+    }
   }
 
   // 6. Collections
@@ -1613,7 +2451,7 @@ export function run(input) {
       const seen = new Set();
       for (let j = 0; j < rawTags.length; j++) {
         const name = rawTags[j];
-        const slug = slugify(name);
+        const slug = slugifyStr(name);
         if (seen.has(slug)) continue;
         seen.add(slug);
         let tag = bySlug.get(slug);
@@ -1638,7 +2476,7 @@ export function run(input) {
       const seen = new Set();
       for (let j = 0; j < rawTags.length; j++) {
         const name = rawTags[j];
-        const slug = slugify(name);
+        const slug = slugifyStr(name);
         if (seen.has(slug)) continue;
         seen.add(slug);
         const existing = bySlug.get(slug);
@@ -1684,33 +2522,38 @@ export function run(input) {
     return obj;
   };
 
-  const cardOf = (s) => ({
+  const cardOf = (s, postId) => ({
     title: s.data.title,
     url: s.url,
     date: s.data.date ?? '',
     date_long: fmtDate(s.data.date),
     summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(countWords(s.text, s.bodyStart) / 200)),
+    excerpt: '',
+    reading_minutes: Math.max(1, Math.ceil(countWordsBytes(srcArena, s.bodyStart, s.sEnd) / 200)),
     tags: s.tagRefs,
+    _excerptStart: s.excerptStart,
+    _excerptEnd: s.excerptEnd,
+    _postId: postId,
   });
 
-  const cards = new Map();
+  const postCards = new Array(posts.length);
   for (let i = 0; i < posts.length; i++) {
-    cards.set(posts[i], cardOf(posts[i]));
+    const c = cardOf(posts[i], i);
+    posts[i]._card = c;
+    postCards[i] = c;
   }
 
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recentCount = Math.min(input.site.recent, posts.length);
   const recent = new Array(recentCount);
-  for (let i = 0; i < recentCount; i++) recent[i] = cards.get(posts[i]);
+  for (let i = 0; i < recentCount; i++) recent[i] = postCards[i];
 
   const baseSafe = escapeHtml(base) === base;
   const siteGlobals = { site, tags: allTags, recent };
-  const getCompiler = createTemplateRunner(templates, siteGlobals, baseSafe);
-  const output = {};
+  const engine = createTemplateEngine(templates, siteGlobals, baseSafe, posts.length);
 
+  const builtSet = new Set();
   const reusePage = {
     title: '',
     url: '',
@@ -1726,32 +2569,41 @@ export function run(input) {
     newer: null,
     older: null,
     is_post: false,
+    _htmlStart: 0,
+    _htmlEnd: 0,
+    _excerptStart: 0,
+    _excerptEnd: 0,
   };
   const pageVars = { site, tags: allTags, recent, page: reusePage };
 
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
-    const fn = getCompiler(s.layout, 0, 'page');
-    const c = s.post ? cards.get(s) : cardOf(s);
+    const prog = engine.compileEntry(s.layout, 0, 'page');
+    const c = s.post ? s._card : cardOf(s, undefined);
     reusePage.title = c.title;
     reusePage.url = c.url;
     reusePage.date = c.date;
     reusePage.date_long = c.date_long;
     reusePage.summary = c.summary;
-    reusePage.excerpt = c.excerpt;
     reusePage.reading_minutes = c.reading_minutes;
     reusePage.tags = c.tags;
     reusePage.slug = s.slug;
-    reusePage.content = s.html;
     reusePage.toc = s.toc;
     reusePage.newer = linkOf(s.newer ?? null);
     reusePage.older = linkOf(s.older ?? null);
     reusePage.is_post = s.post;
-    output[`${s.outDir}/index.html`] = fn(pageVars);
+    reusePage._htmlStart = s.htmlStart;
+    reusePage._htmlEnd = s.htmlEnd;
+    reusePage._excerptStart = s.excerptStart;
+    reusePage._excerptEnd = s.excerptEnd;
+    const pStart = engine.renderToOutArena(prog, pageVars);
+    const outPath = `${s.outDir}/index.html`;
+    builtSet.add(outPath);
+    emitPage(outPath, pStart, outPos);
   }
 
-  const indexFn = getCompiler('index', 0, 'index');
-  if (indexFn !== null) {
+  const indexProg = engine.compileEntry('index', 0, 'index');
+  if (indexProg !== null) {
     const per = input.site.per_page;
     const pages = Math.max(1, Math.ceil(posts.length / per));
     const indexUrl = (k) => (k === 1 ? `${base}/` : `${base}/page/${k}/`);
@@ -1761,49 +2613,230 @@ export function run(input) {
       const start = (k - 1) * per;
       const end = Math.min(k * per, posts.length);
       const pagePosts = new Array(Math.max(0, end - start));
-      for (let j = start; j < end; j++) pagePosts[j - start] = cards.get(posts[j]);
+      for (let j = start; j < end; j++) pagePosts[j - start] = postCards[j];
       reusePager.number = k;
       reusePager.url = indexUrl(k);
       reusePager.newer_url = k === 1 ? '' : indexUrl(k - 1);
       reusePager.older_url = k === pages ? '' : indexUrl(k + 1);
       indexVars.posts = pagePosts;
-      output[k === 1 ? 'index.html' : `page/${k}/index.html`] = indexFn(indexVars);
+      const pStart = engine.renderToOutArena(indexProg, indexVars);
+      const outPath = k === 1 ? 'index.html' : `page/${k}/index.html`;
+      builtSet.add(outPath);
+      emitPage(outPath, pStart, outPos);
     }
   }
 
-  const tagFn = getCompiler('tag', 0, 'tag');
-  if (tagFn !== null) {
+  const tagProg = engine.compileEntry('tag', 0, 'tag');
+  if (tagProg !== null) {
     const reuseTag = { name: '', slug: '', url: '', count: 0, posts: null };
     const tagVars = { site, tags: allTags, recent, tag: reuseTag };
     for (let i = 0; i < tags.length; i++) {
       const t = tags[i];
       const tPosts = new Array(t.posts.length);
-      for (let j = 0; j < t.posts.length; j++) tPosts[j] = cards.get(t.posts[j]);
+      for (let j = 0; j < t.posts.length; j++) tPosts[j] = t.posts[j]._card;
       reuseTag.name = t.name;
       reuseTag.slug = t.slug;
       reuseTag.url = t.url;
       reuseTag.count = t.posts.length;
       reuseTag.posts = tPosts;
-      output[`tags/${t.slug}/index.html`] = tagFn(tagVars);
+      const pStart = engine.renderToOutArena(tagProg, tagVars);
+      const outPath = `tags/${t.slug}/index.html`;
+      builtSet.add(outPath);
+      emitPage(outPath, pStart, outPos);
     }
   }
 
-  const tagsFn = getCompiler('tags', 0, 'tags');
-  if (tagsFn !== null) {
-    output['tags/index.html'] = tagsFn({ site, tags: allTags, recent });
+  const tagsProg = engine.compileEntry('tags', 0, 'tags');
+  if (tagsProg !== null) {
+    const pStart = engine.renderToOutArena(tagsProg, { site, tags: allTags, recent });
+    builtSet.add('tags/index.html');
+    emitPage('tags/index.html', pStart, outPos);
   }
 
   for (let i = 0; i < statics.length; i++) {
     const f = statics[i];
-    if (Object.hasOwn(output, f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
-    else output[f.path] = f.content;
+    if (builtSet.has(f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
+    else emitStatic(f.path, f.content);
   }
 
   // 9. Report
   const lines = [...report, ...broken].sort(byCodeUnits);
   const pageCount = kept.length - posts.length;
   lines.push(`built ${pageCount} pages, ${posts.length} posts, ${tags.length} tags and ${statics.length} static files`);
-  output[REPORT_FILE] = `${lines.join('\n')}\n`;
+  emitStatic(REPORT_FILE, `${lines.join('\n')}\n`);
+}
 
+// ---------------------------------------------------------------- JSON Arena Escaper
+
+function jsonWriteAscii(str) {
+  const len = str.length;
+  if (jsonPos + len > jsonArena.length) ensureJson(len);
+  const dst = jsonArena;
+  let p = jsonPos;
+  for (let i = 0; i < len; i++) dst[p++] = str.charCodeAt(i);
+  jsonPos = p;
+}
+
+function jsonWriteQuotedBytes(src, start, end) {
+  const len = end - start;
+  if (jsonPos + len * 6 + 2 > jsonArena.length) ensureJson(len * 6 + 2);
+  const dst = jsonArena;
+  let p = jsonPos;
+  dst[p++] = 34; // "
+  let i = start;
+
+  // Fast 4-byte aligned SWAR scan when src is outArena (4-byte aligned backing)
+  if (len >= 16 && src === outArena) {
+    while (i < end && (i & 3) !== 0) {
+      const c = src[i++];
+      if (JSON_SPECIAL[c] !== 0) {
+        if (c === 34) { dst[p++] = 92; dst[p++] = 34; }
+        else if (c === 92) { dst[p++] = 92; dst[p++] = 92; }
+        else if (c === 10) { dst[p++] = 92; dst[p++] = 110; }
+        else if (c === 13) { dst[p++] = 92; dst[p++] = 114; }
+        else if (c === 9) { dst[p++] = 92; dst[p++] = 116; }
+        else if (c === 8) { dst[p++] = 92; dst[p++] = 98; }
+        else if (c === 12) { dst[p++] = 92; dst[p++] = 102; }
+        else {
+          dst[p++] = 92; dst[p++] = 117; dst[p++] = 48; dst[p++] = 48;
+          dst[p++] = HEX_LO.charCodeAt(c >> 4);
+          dst[p++] = HEX_LO.charCodeAt(c & 15);
+        }
+      } else {
+        dst[p++] = c;
+      }
+    }
+    const u32 = outU32;
+    let wi = i >>> 2;
+    const wEnd = end >>> 2;
+    while (wi < wEnd) {
+      const w = u32[wi];
+      const lt32 = ~((w & 0x7f7f7f7f) + 0x60606060) & ~w & 0x80808080;
+      const xq = w ^ 0x22222222;
+      const eq34 = (xq - 0x01010101) & ~xq & 0x80808080;
+      const xb = w ^ 0x5c5c5c5c;
+      const eq92 = (xb - 0x01010101) & ~xb & 0x80808080;
+      if ((lt32 | eq34 | eq92) === 0) {
+        dst[p] = w & 255;
+        dst[p + 1] = (w >>> 8) & 255;
+        dst[p + 2] = (w >>> 16) & 255;
+        dst[p + 3] = w >>> 24;
+        p += 4;
+        wi++;
+      } else {
+        const j = wi << 2;
+        for (let k = 0; k < 4; k++) {
+          const c = src[j + k];
+          if (JSON_SPECIAL[c] !== 0) {
+            if (c === 34) { dst[p++] = 92; dst[p++] = 34; }
+            else if (c === 92) { dst[p++] = 92; dst[p++] = 92; }
+            else if (c === 10) { dst[p++] = 92; dst[p++] = 110; }
+            else if (c === 13) { dst[p++] = 92; dst[p++] = 114; }
+            else if (c === 9) { dst[p++] = 92; dst[p++] = 116; }
+            else if (c === 8) { dst[p++] = 92; dst[p++] = 98; }
+            else if (c === 12) { dst[p++] = 92; dst[p++] = 102; }
+            else {
+              dst[p++] = 92; dst[p++] = 117; dst[p++] = 48; dst[p++] = 48;
+              dst[p++] = HEX_LO.charCodeAt(c >> 4);
+              dst[p++] = HEX_LO.charCodeAt(c & 15);
+            }
+          } else {
+            dst[p++] = c;
+          }
+        }
+        wi++;
+      }
+    }
+    i = wEnd << 2;
+  }
+
+  while (i < end) {
+    const c = src[i++];
+    if (JSON_SPECIAL[c] !== 0) {
+      if (c === 34) { dst[p++] = 92; dst[p++] = 34; }
+      else if (c === 92) { dst[p++] = 92; dst[p++] = 92; }
+      else if (c === 10) { dst[p++] = 92; dst[p++] = 110; }
+      else if (c === 13) { dst[p++] = 92; dst[p++] = 114; }
+      else if (c === 9) { dst[p++] = 92; dst[p++] = 116; }
+      else if (c === 8) { dst[p++] = 92; dst[p++] = 98; }
+      else if (c === 12) { dst[p++] = 92; dst[p++] = 102; }
+      else {
+        dst[p++] = 92; dst[p++] = 117; dst[p++] = 48; dst[p++] = 48;
+        dst[p++] = HEX_LO.charCodeAt(c >> 4);
+        dst[p++] = HEX_LO.charCodeAt(c & 15);
+      }
+    } else {
+      dst[p++] = c;
+    }
+  }
+  dst[p++] = 34; // "
+  jsonPos = p;
+}
+
+function jsonWriteQuotedStr(str) {
+  const nb = Buffer.byteLength(str);
+  ensureScratch(nb);
+  scratchArena.utf8Write(str, 0);
+  jsonWriteQuotedBytes(scratchArena, 0, nb);
+}
+
+// ---------------------------------------------------------------- Exports
+
+export function run(input) {
+  const output = {};
+  buildSiteCore(
+    input,
+    (path, start, end) => {
+      output[path] = outArena.toString('utf8', start, end);
+    },
+    (path, str) => {
+      output[path] = str;
+    },
+  );
   return output;
+}
+
+export function runCasesToBuffer(cases) {
+  jsonPos = 0;
+  if (jsonArena.length < 2) ensureJson(2);
+  jsonArena[jsonPos++] = 91; // [
+  for (let i = 0; i < cases.length; i++) {
+    if (i > 0) {
+      if (jsonPos + 1 > jsonArena.length) ensureJson(1);
+      jsonArena[jsonPos++] = 44; // ,
+    }
+    if (jsonPos + 1 > jsonArena.length) ensureJson(1);
+    jsonArena[jsonPos++] = 123; // {
+    let firstProp = true;
+    buildSiteCore(
+      cases[i].input,
+      (path, start, end) => {
+        if (!firstProp) {
+          if (jsonPos + 1 > jsonArena.length) ensureJson(1);
+          jsonArena[jsonPos++] = 44;
+        }
+        firstProp = false;
+        jsonWriteQuotedStr(path);
+        if (jsonPos + 1 > jsonArena.length) ensureJson(1);
+        jsonArena[jsonPos++] = 58; // :
+        jsonWriteQuotedBytes(outArena, start, end);
+      },
+      (path, str) => {
+        if (!firstProp) {
+          if (jsonPos + 1 > jsonArena.length) ensureJson(1);
+          jsonArena[jsonPos++] = 44;
+        }
+        firstProp = false;
+        jsonWriteQuotedStr(path);
+        if (jsonPos + 1 > jsonArena.length) ensureJson(1);
+        jsonArena[jsonPos++] = 58; // :
+        jsonWriteQuotedStr(str);
+      },
+    );
+    if (jsonPos + 1 > jsonArena.length) ensureJson(1);
+    jsonArena[jsonPos++] = 125; // }
+  }
+  if (jsonPos + 1 > jsonArena.length) ensureJson(1);
+  jsonArena[jsonPos++] = 93; // ]
+  return jsonArena.subarray(0, jsonPos);
 }
