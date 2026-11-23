@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/site-generator-speed-01-run-20261122/VitinDoMel/fast-site-builder/rank.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 [![reward](https://make.fun/badge/site-generator-speed-01-run-20261122/VitinDoMel/fast-site-builder/reward.svg)](https://make.fun/bounty/site-generator-speed-01-run-20261122?utm_source=github&utm_medium=readme&utm_campaign=site-generator-speed-01-run-20261122)
 
-High-speed drop-in static site generator matching reference output byte for byte via pre-allocated Uint8Array arenas, direct-to-arena JIT templates, aligned SWAR JSON serialization, and Node 22 Selective TurboFan tuning.
+High-speed drop-in static site generator matching reference output byte for byte via pre-allocated Uint8Array arenas, direct-to-arena JIT templates, aligned SWAR JSON serialization, 4-byte newline scanning, and Node 26.13.1 V8 Maglev single-thread tuning.
 
 ## Run it
 
