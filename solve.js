@@ -96,6 +96,9 @@ let scratchArena = Buffer.allocUnsafe(256 * 1024);
 
 let linkArena = Buffer.allocUnsafe(512 * 1024);
 let linkPos = 0;
+let linkOffs = new Int32Array(2048);
+let linkLens = new Int32Array(2048);
+let linkCount = 0;
 
 function growArena(cur, minSize) {
   let cap = cur.length;
@@ -323,6 +326,20 @@ function vmWriteStrRaw(str) {
   vmPos = p;
 }
 
+function vmWriteNonAsciiEscaped(str) {
+  ensureScratch(str.length * 3);
+  const nb = scratchArena.utf8Write(str, 0);
+  vmWriteEscapeSpan(scratchArena, 0, nb);
+}
+
+function vmWriteHtmlEntity(c, dst, p) {
+  if (c === 38) { dst[p] = 38; dst[p + 1] = 97; dst[p + 2] = 109; dst[p + 3] = 112; dst[p + 4] = 59; return p + 5; }
+  if (c === 60) { dst[p] = 38; dst[p + 1] = 108; dst[p + 2] = 116; dst[p + 3] = 59; return p + 4; }
+  if (c === 62) { dst[p] = 38; dst[p + 1] = 103; dst[p + 2] = 116; dst[p + 3] = 59; return p + 4; }
+  if (c === 34) { dst[p] = 38; dst[p + 1] = 113; dst[p + 2] = 117; dst[p + 3] = 111; dst[p + 4] = 116; dst[p + 5] = 59; return p + 6; }
+  dst[p] = 38; dst[p + 1] = 35; dst[p + 2] = 51; dst[p + 3] = 57; dst[p + 4] = 59; return p + 5;
+}
+
 function vmWriteStrEscaped(str) {
   const len = str.length;
   if (len === 0) return;
@@ -332,24 +349,10 @@ function vmWriteStrEscaped(str) {
   for (let i = 0; i < len; i++) {
     const c = str.charCodeAt(i);
     if (c < 128) {
-      if (HTML_SPECIAL[c] === 0) {
-        dst[p++] = c;
-      } else if (c === 38) {
-        dst[p] = 38; dst[p + 1] = 97; dst[p + 2] = 109; dst[p + 3] = 112; dst[p + 4] = 59; p += 5;
-      } else if (c === 60) {
-        dst[p] = 38; dst[p + 1] = 108; dst[p + 2] = 116; dst[p + 3] = 59; p += 4;
-      } else if (c === 62) {
-        dst[p] = 38; dst[p + 1] = 103; dst[p + 2] = 116; dst[p + 3] = 59; p += 4;
-      } else if (c === 34) {
-        dst[p] = 38; dst[p + 1] = 113; dst[p + 2] = 117; dst[p + 3] = 111; dst[p + 4] = 116; dst[p + 5] = 59; p += 6;
-      } else {
-        dst[p] = 38; dst[p + 1] = 35; dst[p + 2] = 51; dst[p + 3] = 57; dst[p + 4] = 59; p += 5;
-      }
+      if (HTML_SPECIAL[c] === 0) dst[p++] = c;
+      else p = vmWriteHtmlEntity(c, dst, p);
     } else {
-      // Non-ASCII: encode into scratch, then byte-escape
-      ensureScratch(len * 3);
-      const nb = scratchArena.utf8Write(str, 0);
-      vmWriteEscapeSpan(scratchArena, 0, nb);
+      vmWriteNonAsciiEscaped(str);
       return;
     }
   }
@@ -1675,41 +1678,15 @@ const ROLE_PRESENT_OBJ = {
   site: new Set(),
 };
 
-// VM Opcodes
-const OP_BYTES = 1;     // [off, len] -> copy from tplArena
-const OP_VAR_ESC = 2;   // [pathId]
-const OP_VAR_RAW = 3;   // [pathId]
-const OP_IF = 4;        // [pathId, notFlag, elsePc]
-const OP_JUMP = 5;      // [targetPc]
-const OP_FOR_INIT = 6;  // [pathId, slotIdx, endPc]
-const OP_FOR_NEXT = 7;  // [slotIdx, bodyPc]
-const OP_CARD_LOOP = 8; // [pathId, cardTplIdx]
-const OP_LOOP_PROP = 9; // [propKind] 0=index,1=first,2=last,3=length
-
-// Special sentinel returned by path resolver when value lives in mdArena
-const SPAN_SENTINEL = {};
-let _spanStart = 0;
-let _spanEnd = 0;
-
 function createTemplateEngine(templatesMap, siteGlobals, baseSafe, totalPosts) {
   tplPos = 0;
   cardPos = 0;
-
-  const compiledPrograms = new Map();
-  const staticPartials = new Map(); // pKey -> { off, len } inside tplArena
+  const compiled = new Map();
+  const staticPartials = new Map();
   const freeVarsCache = new Map();
-  const cardPrograms = []; // cardTplKey -> { idx, prog }
-  const cardProgByName = new Map();
-  // Per-post cached card spans [start, end] per cardTplIdx (lazy)
-  const cardStarts = [];
-  const cardEnds = [];
-
-  const loopElem = new Array(16);
-  const loopArr = new Array(16);
-  const loopK = new Int32Array(16);
-  const loopLen = new Int32Array(16);
-  const activeLoopStack = new Int32Array(16);
-  let activeLoopTop = -1;
+  const cardStarts = new Map();
+  const cardEnds = new Map();
+  const cardVars = { site: siteGlobals.site, tags: siteGlobals.tags, recent: siteGlobals.recent, p: null };
 
   function getFreeVars(name, depth) {
     const k = `${name}@${depth}`;
@@ -1723,42 +1700,84 @@ function createTemplateEngine(templatesMap, siteGlobals, baseSafe, totalPosts) {
     return s;
   }
 
-  function isSafeNoEscapePath(path) {
-    if (path.length < 2) return false;
-    const last = path[path.length - 1];
-    if (SAFE_STR_PROPS.has(last) || NUM_PROPS.has(last)) return true;
-    if (baseSafe && SAFE_URL_PROPS.has(last)) return true;
-    return false;
+  function wb(off, len) { vmWriteBytes(tplArena, off, off + len); }
+  function we(v) {
+    if (typeof v === 'string') vmWriteStrEscaped(v);
+    else if (typeof v === 'number') vmWriteInt(v);
+    else if (typeof v === 'boolean') vmWriteStrRaw(v ? 'true' : 'false');
+    else if (Array.isArray(v)) vmWriteStrEscaped(textOf(v));
+  }
+  function wr(v) {
+    if (typeof v === 'string') vmWriteStrRaw(v);
+    else if (typeof v === 'number') vmWriteInt(v);
+    else if (typeof v === 'boolean') vmWriteStrRaw(v ? 'true' : 'false');
+    else if (Array.isArray(v)) vmWriteStrRaw(textOf(v));
+  }
+  function wsp(s, e) { if (e > s) vmWriteBytes(mdArena, s, e); }
+  function wse(s, e) { if (e > s) vmWriteEscapeSpan(mdArena, s, e); }
+
+  function cardRender(p, incName, incDepth) {
+    const pid = p._postId;
+    if (pid !== undefined) {
+      const ck = `${incName}@${incDepth}`;
+      let csArr = cardStarts.get(ck);
+      let ceArr;
+      if (csArr === undefined) {
+        csArr = new Int32Array(totalPosts).fill(-1);
+        ceArr = new Int32Array(totalPosts);
+        cardStarts.set(ck, csArr);
+        cardEnds.set(ck, ceArr);
+      } else {
+        ceArr = cardEnds.get(ck);
+      }
+      let cs = csArr[pid];
+      let ce;
+      if (cs === -1) {
+        const subFn = compileEntry(incName, incDepth, 'card');
+        const sb = vmBuf, sp = vmPos, sc = vmIsCard;
+        cs = cardPos;
+        vmBuf = cardArena; vmPos = cs; vmIsCard = true;
+        cardVars.p = p;
+        subFn(cardVars);
+        ce = vmPos;
+        cardPos = ce;
+        vmBuf = sb; vmPos = sp; vmIsCard = sc;
+        csArr[pid] = cs; ceArr[pid] = ce;
+      } else {
+        ce = ceArr[pid];
+      }
+      vmWriteBytes(cardArena, cs, ce);
+    } else {
+      const subFn = compileEntry(incName, incDepth, 'card');
+      cardVars.p = p;
+      subFn(cardVars);
+    }
   }
 
   function compileEntry(name, baseDepth, role) {
     const cacheKey = `${name}@${baseDepth}@${role}`;
-    const cached = compiledPrograms.get(cacheKey);
+    const cached = compiled.get(cacheKey);
     if (cached !== undefined) return cached;
     const ast = templatesMap.get(name);
     if (ast === undefined) return null;
 
     const absentRoots = ROLE_ABSENT[role];
     const presentRoots = ROLE_PRESENT_OBJ[role];
-
-    const code = [];
-    const paths = [];
-    let nextSlot = 0;
-
-    let textRunStart = -1; // inside tplArena
-    const startTextRun = () => {
-      if (textRunStart === -1) textRunStart = tplPos;
-    };
-    const appendTextStr = (s) => {
+    let tmpId = 0;
+    const usedTmps = [];
+    const trackedTmp = (p = '_t') => { const t = `${p}${tmpId++}`; usedTmps.push(t); return t; };
+    const lines = [];
+    let textRunStart = -1;
+    const startText = () => { if (textRunStart === -1) textRunStart = tplPos; };
+    const appendText = (s) => {
       if (s === '') return;
-      startTextRun();
-      const len = s.length;
-      if (tplPos + len * 3 > tplArena.length) ensureTpl(len * 3);
+      startText();
+      if (tplPos + s.length * 3 > tplArena.length) ensureTpl(s.length * 3);
       tplPos += tplArena.utf8Write(s, tplPos);
     };
-    const appendTplBytes = (off, len) => {
+    const appendTpl = (off, len) => {
       if (len === 0) return;
-      startTextRun();
+      startText();
       if (tplPos + len > tplArena.length) ensureTpl(len);
       tplArena.copy(tplArena, tplPos, off, off + len);
       tplPos += len;
@@ -1766,58 +1785,68 @@ function createTemplateEngine(templatesMap, siteGlobals, baseSafe, totalPosts) {
     const flushText = () => {
       if (textRunStart !== -1) {
         const len = tplPos - textRunStart;
-        if (len > 0) code.push(OP_BYTES, textRunStart, len);
+        if (len > 0) lines.push(`_wb(${textRunStart},${len});`);
         textRunStart = -1;
       }
     };
-
-    function isShadowed(rootKey, bindings) {
-      for (let i = bindings.length - 1; i >= 0; i--) {
-        if (bindings[i].name === rootKey) return true;
-      }
+    const isShadowed = (rk, bindings) => {
+      for (let i = bindings.length - 1; i >= 0; i--) if (bindings[i].name === rk) return true;
       return false;
-    }
-
-    function tryStaticPath(path, bindings) {
-      const rootKey = path[0];
-      if (isShadowed(rootKey, bindings)) return null;
-      if (rootKey === 'site') {
-        return { found: true, val: resolveStaticValue(siteGlobals.site, path, 1) };
-      }
-      if (absentRoots.has(rootKey)) {
-        return { found: true, val: undefined };
-      }
+    };
+    const tryStaticPath = (path, bindings) => {
+      const rk = path[0];
+      if (isShadowed(rk, bindings)) return null;
+      if (rk === 'site') return { found: true, val: resolveStaticValue(siteGlobals.site, path, 1) };
+      if (absentRoots.has(rk)) return { found: true, val: undefined };
       return null;
-    }
-
-    function makePathDesc(path, bindings) {
-      const rootKey = path[0];
-      let srcKind = 0; // root
-      let srcId = rootKey;
+    };
+    const emitContainerAndLast = (path, bindings) => {
+      const rk = path[0];
+      let baseExpr = null;
       for (let i = bindings.length - 1; i >= 0; i--) {
-        if (rootKey === 'loop') {
-          srcKind = 2;
-          srcId = 0;
+        const b = bindings[i];
+        if (rk === 'loop') {
+          if (path.length === 2) {
+            const prop = path[1];
+            if (prop === 'index') return `(${b.k}+1)`;
+            if (prop === 'first') return `(${b.k}===0)`;
+            if (prop === 'last') return `(${b.k}===${b.len}-1)`;
+            if (prop === 'length') return b.len;
+          }
+          baseExpr = `({index:${b.k}+1,first:${b.k}===0,last:${b.k}===${b.len}-1,length:${b.len}})`;
           break;
         }
-        if (bindings[i].name === rootKey) {
-          srcKind = 1; // slot
-          srcId = bindings[i].slot;
-          break;
-        }
+        if (rk === b.name) { baseExpr = b.v; break; }
       }
+      if (baseExpr === null) baseExpr = `_r.${rk}`;
+      let cur = baseExpr;
+      for (let i = 1; i < path.length; i++) {
+        const seg = path[i];
+        const tmp = trackedTmp();
+        cur = `((${tmp}=${cur})!==null&&typeof ${tmp}==='object'&&Object.hasOwn(${tmp},${JSON.stringify(seg)})?${tmp}[${JSON.stringify(seg)}]:undefined)`;
+      }
+      return cur;
+    };
+    const emitSpanParent = (path, bindings) => {
+      const rk = path[0];
+      let cur = null;
+      for (let i = bindings.length - 1; i >= 0; i--) if (rk === bindings[i].name) { cur = bindings[i].v; break; }
+      if (cur === null) cur = `_r.${rk}`;
+      for (let i = 1; i < path.length - 1; i++) {
+        const seg = path[i];
+        const tmp = trackedTmp();
+        cur = `((${tmp}=${cur})!==null&&typeof ${tmp}==='object'&&Object.hasOwn(${tmp},${JSON.stringify(seg)})?${tmp}[${JSON.stringify(seg)}]:undefined)`;
+      }
+      return cur;
+    };
+    const isSafeNoEscapePath = (path) => {
+      if (path.length < 2) return false;
       const last = path[path.length - 1];
-      let spanKind = 0; // 1: htmlStart/End, 2: excerptStart/End
-      if (path.length >= 2) {
-        if (last === 'content' || last === 'html') spanKind = 1;
-        else if (last === 'excerpt') spanKind = 2;
-      }
-      const id = paths.length;
-      paths.push({ srcKind, srcId, segs: path, len: path.length, spanKind });
-      return id;
-    }
-
-    function isSiteOnlyInclude(incName, depth, bindings) {
+      if (SAFE_STR_PROPS.has(last) || NUM_PROPS.has(last)) return true;
+      if (baseSafe && SAFE_URL_PROPS.has(last)) return true;
+      return false;
+    };
+    const isSiteOnlyInclude = (incName, depth, bindings) => {
       if (depth > INCLUDE_DEPTH || !templatesMap.has(incName)) return false;
       const free = getFreeVars(incName, depth);
       for (const k of free) {
@@ -1826,50 +1855,39 @@ function createTemplateEngine(templatesMap, siteGlobals, baseSafe, totalPosts) {
         return false;
       }
       return true;
-    }
-
-    function getCardIdx(incName, incDepth) {
-      const ck = `${incName}@${incDepth}`;
-      let idx = cardProgByName.get(ck);
-      if (idx === undefined) {
-        idx = cardPrograms.length;
-        cardProgByName.set(ck, idx);
-        const prog = compileEntry(incName, incDepth, 'card');
-        cardPrograms.push(prog);
-        cardStarts.push(new Int32Array(totalPosts).fill(-1));
-        cardEnds.push(new Int32Array(totalPosts));
-      }
-      return idx;
-    }
+    };
 
     function emitNodes(nodes, bindings, depth) {
       for (let i = 0; i < nodes.length; i++) {
         const n = nodes[i];
         switch (n.kind) {
-          case 'text':
-            appendTextStr(n.text);
-            break;
+          case 'text': appendText(n.text); break;
           case 'var':
           case 'raw': {
             const st = tryStaticPath(n.path, bindings);
             if (st !== null) {
               const s = textOf(st.val);
-              appendTextStr(n.kind === 'var' ? escapeHtml(s) : s);
+              appendText(n.kind === 'var' ? escapeHtml(s) : s);
               break;
             }
             flushText();
-            if (n.path[0] === 'loop' && n.path.length === 2 && bindings.length > 0) {
-              const p1 = n.path[1];
-              if (p1 === 'index') { code.push(OP_LOOP_PROP, 0); break; }
-              if (p1 === 'first') { code.push(OP_LOOP_PROP, 1); break; }
-              if (p1 === 'last') { code.push(OP_LOOP_PROP, 2); break; }
-              if (p1 === 'length') { code.push(OP_LOOP_PROP, 3); break; }
+            const last = n.path[n.path.length - 1];
+            if (n.path.length >= 2 && (last === 'content' || last === 'html' || last === 'excerpt')) {
+              const pExpr = emitSpanParent(n.path, bindings);
+              const tp = trackedTmp('_sp');
+              const sF = last === 'excerpt' ? '_excerptStart' : '_htmlStart';
+              const eF = last === 'excerpt' ? '_excerptEnd' : '_htmlEnd';
+              const wFn = n.kind === 'raw' ? '_wsp' : '_wse';
+              const fbFn = n.kind === 'raw' ? '_wr' : '_we';
+              lines.push(`${tp}=${pExpr};if(${tp}&&typeof ${tp}==='object'){if(${tp}.${eF}!==undefined)${wFn}(${tp}.${sF},${tp}.${eF});else if(Object.hasOwn(${tp},'${last}'))${fbFn}(${tp}.${last});}`);
+              break;
             }
-            const pid = makePathDesc(n.path, bindings);
-            if (n.kind === 'raw' || isSafeNoEscapePath(n.path)) {
-              code.push(OP_VAR_RAW, pid);
+            if (n.path[0] === 'loop' && n.path.length === 2 && bindings.length > 0 && (last === 'index' || last === 'length')) {
+              lines.push(`_wi(${emitContainerAndLast(n.path, bindings)});`);
             } else {
-              code.push(OP_VAR_ESC, pid);
+              const expr = emitContainerAndLast(n.path, bindings);
+              const fn = (n.kind === 'raw' || isSafeNoEscapePath(n.path)) ? '_wr' : '_we';
+              lines.push(`${fn}(${expr});`);
             }
             break;
           }
@@ -1888,60 +1906,51 @@ function createTemplateEngine(templatesMap, siteGlobals, baseSafe, totalPosts) {
               break;
             }
             flushText();
-            const pid = makePathDesc(n.path, bindings);
-            const ifIdx = code.length;
-            code.push(OP_IF, pid, n.not ? 1 : 0, 0);
+            const last = n.path[n.path.length - 1];
+            const tv = trackedTmp('_v');
+            if (n.path.length >= 2 && last === 'excerpt') {
+              const tp = trackedTmp('_sp');
+              const pExpr = emitSpanParent(n.path, bindings);
+              lines.push(`${tp}=${pExpr};if(${tp}&&typeof ${tp}==='object'){if(${tp}._excerptEnd!==undefined)${tv}=${tp}._excerptEnd>${tp}._excerptStart;else ${tv}=Object.hasOwn(${tp},'excerpt')?${tp}.excerpt:undefined;}else ${tv}=undefined;`);
+            } else {
+              lines.push(`${tv}=${emitContainerAndLast(n.path, bindings)};`);
+            }
+            const truth = `(Array.isArray(${tv})?${tv}.length>0:(${tv}!==undefined&&${tv}!==null&&${tv}!==false&&${tv}!==""&&${tv}!==0))`;
+            lines.push(`if(${n.not ? '!' + truth : truth}){`);
             emitNodes(n.then, bindings, depth);
             flushText();
             if (n.else !== null) {
-              const jmpIdx = code.length;
-              code.push(OP_JUMP, 0);
-              code[ifIdx + 3] = code.length;
+              lines.push('}else{');
               emitNodes(n.else, bindings, depth);
               flushText();
-              code[jmpIdx + 1] = code.length;
-            } else {
-              code[ifIdx + 3] = code.length;
             }
+            lines.push('}');
             break;
           }
           case 'for': {
             const st = tryStaticPath(n.path, bindings);
             if (st !== null && !Array.isArray(st.val)) break;
             flushText();
-            if (
-              n.body.length === 1 && n.body[0].kind === 'include' &&
-              n.name === 'p' && depth < INCLUDE_DEPTH
-            ) {
+            if (n.body.length === 1 && n.body[0].kind === 'include' && n.name === 'p' && depth < INCLUDE_DEPTH) {
               const incName = n.body[0].name;
               if (templatesMap.has(incName)) {
                 const free = getFreeVars(incName, depth + 1);
                 let onlyP = true;
-                for (const k of free) {
-                  if (k !== 'p' && k !== 'site' && k !== 'tags' && k !== 'recent') {
-                    onlyP = false;
-                    break;
-                  }
-                }
+                for (const k of free) if (k !== 'p' && k !== 'site' && k !== 'tags' && k !== 'recent') { onlyP = false; break; }
                 if (onlyP && !isShadowed('site', bindings) && !isShadowed('tags', bindings) && !isShadowed('recent', bindings)) {
-                  const pid = makePathDesc(n.path, bindings);
-                  const cIdx = getCardIdx(incName, depth + 1);
-                  code.push(OP_CARD_LOOP, pid, cIdx);
+                  const arr = trackedTmp('_a'), lenVar = trackedTmp('_l'), kVar = trackedTmp('_k');
+                  lines.push(`${arr}=${emitContainerAndLast(n.path, bindings)};if(Array.isArray(${arr})){const ${lenVar}=${arr}.length;for(let ${kVar}=0;${kVar}<${lenVar};${kVar}++)_card(${arr}[${kVar}],${JSON.stringify(incName)},${depth + 1});}`);
                   break;
                 }
               }
             }
-            const pid = makePathDesc(n.path, bindings);
-            const slot = nextSlot++;
-            const initIdx = code.length;
-            code.push(OP_FOR_INIT, pid, slot, 0);
-            const bodyPc = code.length;
-            bindings.push({ name: n.name, slot });
+            const arr = trackedTmp('_a'), lenVar = trackedTmp('_l'), kVar = trackedTmp('_k'), elemVar = trackedTmp('_e');
+            lines.push(`${arr}=${emitContainerAndLast(n.path, bindings)};if(Array.isArray(${arr})){const ${lenVar}=${arr}.length;for(let ${kVar}=0;${kVar}<${lenVar};${kVar}++){const ${elemVar}=${arr}[${kVar}];`);
+            bindings.push({ name: n.name, v: elemVar, k: kVar, len: lenVar });
             emitNodes(n.body, bindings, depth);
             flushText();
             bindings.pop();
-            code.push(OP_FOR_NEXT, slot, bodyPc);
-            code[initIdx + 3] = code.length;
+            lines.push('}}');
             break;
           }
           case 'include': {
@@ -1953,15 +1962,11 @@ function createTemplateEngine(templatesMap, siteGlobals, baseSafe, totalPosts) {
                 let slice = staticPartials.get(pKey);
                 if (slice === undefined) {
                   flushText();
-                  const subProg = compileEntry(n.name, depth + 1, role);
-                  const savedBuf = vmBuf;
-                  const savedPos = vmPos;
-                  const savedIsCard = vmIsCard;
+                  const subFn = compileEntry(n.name, depth + 1, role);
+                  const sb = vmBuf, sp = vmPos, sc = vmIsCard;
                   const baseOut = outPos;
-                  vmBuf = outArena;
-                  vmPos = baseOut;
-                  vmIsCard = false;
-                  execProg(subProg, siteGlobals);
+                  vmBuf = outArena; vmPos = baseOut; vmIsCard = false;
+                  subFn(siteGlobals);
                   const len = vmPos - baseOut;
                   const tOff = tplPos;
                   if (len > 0) {
@@ -1971,13 +1976,11 @@ function createTemplateEngine(templatesMap, siteGlobals, baseSafe, totalPosts) {
                     textRunStart = tOff;
                   }
                   outPos = baseOut;
-                  vmBuf = savedBuf;
-                  vmPos = savedPos;
-                  vmIsCard = savedIsCard;
+                  vmBuf = sb; vmPos = sp; vmIsCard = sc;
                   slice = { off: tOff, len };
                   staticPartials.set(pKey, slice);
                 } else {
-                  appendTplBytes(slice.off, slice.len);
+                  appendTpl(slice.off, slice.len);
                 }
               } else {
                 flushText();
@@ -1992,231 +1995,21 @@ function createTemplateEngine(templatesMap, siteGlobals, baseSafe, totalPosts) {
 
     emitNodes(ast, [], baseDepth);
     flushText();
-    const prog = { ops: Int32Array.from(code), paths };
-    compiledPrograms.set(cacheKey, prog);
-    return prog;
+    const decl = usedTmps.length > 0 ? `let ${usedTmps.join(',')};` : '';
+    const fn = new Function('_r', '_wb', '_we', '_wr', '_wsp', '_wse', '_wi', '_card', decl + '\n' + lines.join('\n'));
+    const wrapper = (vars) => fn(vars, wb, we, wr, wsp, wse, vmWriteInt, cardRender);
+    compiled.set(cacheKey, wrapper);
+    return wrapper;
   }
 
-  function resolvePath(desc, vars) {
-    const segs = desc.segs;
-    const slen = desc.len;
-    let cur;
-    if (desc.srcKind === 1) {
-      cur = loopElem[desc.srcId];
-    } else if (desc.srcKind === 0) {
-      const k = segs[0];
-      cur = Object.hasOwn(vars, k) ? vars[k] : undefined;
-    } else {
-      if (activeLoopTop < 0) cur = undefined;
-      else {
-        const s = activeLoopStack[activeLoopTop];
-        cur = {
-          index: loopK[s] + 1,
-          first: loopK[s] === 0,
-          last: loopK[s] === loopLen[s] - 1,
-          length: loopLen[s],
-        };
-      }
-    }
-
-    if (slen === 1) return cur;
-
-    const lastIdx = slen - 1;
-    for (let i = 1; i < lastIdx; i++) {
-      if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
-      const seg = segs[i];
-      cur = Object.hasOwn(cur, seg) ? cur[seg] : undefined;
-    }
-
-    if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
-    const lastSeg = segs[lastIdx];
-
-    if (desc.spanKind !== 0) {
-      if (desc.spanKind === 1) {
-        if (cur._htmlEnd !== undefined) {
-          _spanStart = cur._htmlStart;
-          _spanEnd = cur._htmlEnd;
-          return SPAN_SENTINEL;
-        }
-      } else {
-        if (cur._excerptEnd !== undefined) {
-          _spanStart = cur._excerptStart;
-          _spanEnd = cur._excerptEnd;
-          return SPAN_SENTINEL;
-        }
-      }
-    }
-
-    return Object.hasOwn(cur, lastSeg) ? cur[lastSeg] : undefined;
-  }
-
-  const cardVars = { site: siteGlobals.site, tags: siteGlobals.tags, recent: siteGlobals.recent, p: null };
-
-  function execProg(prog, vars) {
-    const ops = prog.ops;
-    const opsLen = ops.length;
-    const paths = prog.paths;
-    let pc = 0;
-
-    while (pc < opsLen) {
-      const op = ops[pc++];
-      switch (op) {
-        case OP_BYTES: {
-          const off = ops[pc++];
-          const len = ops[pc++];
-          vmWriteBytes(tplArena, off, off + len);
-          break;
-        }
-        case OP_VAR_ESC: {
-          const v = resolvePath(paths[ops[pc++]], vars);
-          if (v === SPAN_SENTINEL) {
-            if (_spanEnd > _spanStart) vmWriteEscapeSpan(mdArena, _spanStart, _spanEnd);
-          } else if (typeof v === 'string') {
-            vmWriteStrEscaped(v);
-          } else if (typeof v === 'number') {
-            vmWriteInt(v);
-          } else if (typeof v === 'boolean') {
-            vmWriteStrRaw(v ? 'true' : 'false');
-          } else if (Array.isArray(v)) {
-            vmWriteStrEscaped(textOf(v));
-          }
-          break;
-        }
-        case OP_VAR_RAW: {
-          const v = resolvePath(paths[ops[pc++]], vars);
-          if (v === SPAN_SENTINEL) {
-            if (_spanEnd > _spanStart) vmWriteBytes(mdArena, _spanStart, _spanEnd);
-          } else if (typeof v === 'string') {
-            vmWriteStrRaw(v);
-          } else if (typeof v === 'number') {
-            vmWriteInt(v);
-          } else if (typeof v === 'boolean') {
-            vmWriteStrRaw(v ? 'true' : 'false');
-          } else if (Array.isArray(v)) {
-            vmWriteStrRaw(textOf(v));
-          }
-          break;
-        }
-        case OP_LOOP_PROP: {
-          const pk = ops[pc++];
-          const s = activeLoopStack[activeLoopTop];
-          if (pk === 0) vmWriteInt(loopK[s] + 1);
-          else if (pk === 1) vmWriteStrRaw(loopK[s] === 0 ? 'true' : 'false');
-          else if (pk === 2) vmWriteStrRaw(loopK[s] === loopLen[s] - 1 ? 'true' : 'false');
-          else vmWriteInt(loopLen[s]);
-          break;
-        }
-        case OP_IF: {
-          const v = resolvePath(paths[ops[pc++]], vars);
-          const notF = ops[pc++] !== 0;
-          const elsePc = ops[pc++];
-          let truth;
-          if (v === SPAN_SENTINEL) {
-            truth = _spanEnd > _spanStart;
-          } else if (Array.isArray(v)) {
-            truth = v.length > 0;
-          } else {
-            truth = v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
-          }
-          if (truth === notF) pc = elsePc;
-          break;
-        }
-        case OP_JUMP: {
-          pc = ops[pc];
-          break;
-        }
-        case OP_FOR_INIT: {
-          const arr = resolvePath(paths[ops[pc++]], vars);
-          const slot = ops[pc++];
-          const endPc = ops[pc++];
-          if (!Array.isArray(arr) || arr.length === 0) {
-            pc = endPc;
-          } else {
-            loopArr[slot] = arr;
-            loopLen[slot] = arr.length;
-            loopK[slot] = 0;
-            loopElem[slot] = arr[0];
-            activeLoopStack[++activeLoopTop] = slot;
-          }
-          break;
-        }
-        case OP_FOR_NEXT: {
-          const slot = ops[pc++];
-          const bodyPc = ops[pc++];
-          const nk = loopK[slot] + 1;
-          if (nk < loopLen[slot]) {
-            loopK[slot] = nk;
-            loopElem[slot] = loopArr[slot][nk];
-            pc = bodyPc;
-          } else {
-            activeLoopTop--;
-          }
-          break;
-        }
-        case OP_CARD_LOOP: {
-          const arr = resolvePath(paths[ops[pc++]], vars);
-          const cIdx = ops[pc++];
-          if (Array.isArray(arr) && arr.length > 0) {
-            const cStarts = cardStarts[cIdx];
-            const cEnds = cardEnds[cIdx];
-            const cProg = cardPrograms[cIdx];
-            for (let j = 0; j < arr.length; j++) {
-              const p = arr[j];
-              const pId = p._postId;
-              if (pId !== undefined) {
-                let cs = cStarts[pId];
-                let ce;
-                if (cs === -1) {
-                  const savedBuf = vmBuf;
-                  const savedPos = vmPos;
-                  const savedIsCard = vmIsCard;
-                  const savedLoopTop = activeLoopTop;
-                  cs = cardPos;
-                  vmBuf = cardArena;
-                  vmPos = cs;
-                  vmIsCard = true;
-                  activeLoopTop = -1;
-                  cardVars.p = p;
-                  execProg(cProg, cardVars);
-                  ce = vmPos;
-                  cardPos = ce;
-                  vmBuf = savedBuf;
-                  vmPos = savedPos;
-                  vmIsCard = savedIsCard;
-                  activeLoopTop = savedLoopTop;
-                  cStarts[pId] = cs;
-                  cEnds[pId] = ce;
-                } else {
-                  ce = cEnds[pId];
-                }
-                vmWriteBytes(cardArena, cs, ce);
-              } else {
-                // Edge fallback if non-post array used in `for p in ...` + card include
-                const savedTop = activeLoopTop;
-                activeLoopTop = -1;
-                cardVars.p = p;
-                execProg(cProg, cardVars);
-                activeLoopTop = savedTop;
-              }
-            }
-          }
-          break;
-        }
-      }
-    }
-  }
-
-  function renderToOutArena(prog, vars) {
+  function renderToOutArena(fn, vars) {
     const start = outPos;
-    vmBuf = outArena;
-    vmPos = start;
-    vmIsCard = false;
-    activeLoopTop = -1;
-    execProg(prog, vars);
-    outPos = vmPos;
-    return start;
+    vmBuf = outArena; vmPos = start; vmIsCard = false;
+    fn(vars);
+    const end = vmPos;
+    outPos = (end + 3) & ~3;
+    return [start, end];
   }
-
   return { compileEntry, renderToOutArena };
 }
 
@@ -2326,6 +2119,7 @@ function buildSiteCore(input, emitPage, emitStatic) {
   const dirEscLinkCaches = new Map();
 
   linkPos = 0;
+  linkCount = 0;
 
   const allocLinkSlice = (str) => {
     const maxB = str.length * 3;
@@ -2334,7 +2128,14 @@ function buildSiteCore(input, emitPage, emitStatic) {
     const nb = linkArena.utf8Write(str, off);
     linkPos = off + nb;
     ensureMd(nb + 4096);
-    return off * 65536 + nb;
+    const id = linkCount++;
+    if (id >= linkOffs.length) {
+      const no = new Int32Array(linkOffs.length * 2); no.set(linkOffs); linkOffs = no;
+      const nl = new Int32Array(linkLens.length * 2); nl.set(linkLens); linkLens = nl;
+    }
+    linkOffs[id] = off;
+    linkLens[id] = nb;
+    return id;
   };
 
   for (let i = 0; i < kept.length; i++) {
@@ -2353,11 +2154,10 @@ function buildSiteCore(input, emitPage, emitStatic) {
     const env = {
       writeEscapedLink(buf, start, end) {
         const target = buf.toString('utf8', start, end);
-        let packed = dirEscCache.get(target);
-        if (packed !== undefined) {
-          const lLen = packed & 65535;
-          const lOff = (packed - lLen) / 65536;
-          mdCopySpan(linkArena, lOff, lOff + lLen);
+        let id = dirEscCache.get(target);
+        if (id !== undefined) {
+          const lOff = linkOffs[id];
+          mdCopySpan(linkArena, lOff, lOff + linkLens[id]);
           return;
         }
 
@@ -2369,9 +2169,8 @@ function buildSiteCore(input, emitPage, emitStatic) {
             extEscCache.set(target, pExt);
           }
           dirEscCache.set(target, pExt);
-          const lLen = pExt & 65535;
-          const lOff = (pExt - lLen) / 65536;
-          mdCopySpan(linkArena, lOff, lOff + lLen);
+          const lOff = linkOffs[pExt];
+          mdCopySpan(linkArena, lOff, lOff + linkLens[pExt]);
           return;
         }
         const hash = target.indexOf('#');
@@ -2394,9 +2193,8 @@ function buildSiteCore(input, emitPage, emitStatic) {
           if (resolvedUrl !== null) {
             const pRel = allocLinkSlice(escapeHtml(frag === '' ? resolvedUrl : `${resolvedUrl}${frag}`));
             dirEscCache.set(target, pRel);
-            const lLen = pRel & 65535;
-            const lOff = (pRel - lLen) / 65536;
-            mdCopySpan(linkArena, lOff, lOff + lLen);
+            const lOff = linkOffs[pRel];
+            mdCopySpan(linkArena, lOff, lOff + linkLens[pRel]);
             return;
           }
         }
@@ -2406,9 +2204,8 @@ function buildSiteCore(input, emitPage, emitStatic) {
           pExt = allocLinkSlice(escapeHtml(target));
           extEscCache.set(target, pExt);
         }
-        const lLen = pExt & 65535;
-        const lOff = (pExt - lLen) / 65536;
-        mdCopySpan(linkArena, lOff, lOff + lLen);
+        const lOff = linkOffs[pExt];
+        mdCopySpan(linkArena, lOff, lOff + linkLens[pExt]);
       },
     };
     const md = renderMarkdownToArena(srcArena, s.bodyStart, s.sEnd, env, slugifyBuf);
@@ -2596,10 +2393,10 @@ function buildSiteCore(input, emitPage, emitStatic) {
     reusePage._htmlEnd = s.htmlEnd;
     reusePage._excerptStart = s.excerptStart;
     reusePage._excerptEnd = s.excerptEnd;
-    const pStart = engine.renderToOutArena(prog, pageVars);
+    const pSpan = engine.renderToOutArena(prog, pageVars);
     const outPath = `${s.outDir}/index.html`;
     builtSet.add(outPath);
-    emitPage(outPath, pStart, outPos);
+    emitPage(outPath, pSpan[0], pSpan[1]);
   }
 
   const indexProg = engine.compileEntry('index', 0, 'index');
@@ -2619,10 +2416,10 @@ function buildSiteCore(input, emitPage, emitStatic) {
       reusePager.newer_url = k === 1 ? '' : indexUrl(k - 1);
       reusePager.older_url = k === pages ? '' : indexUrl(k + 1);
       indexVars.posts = pagePosts;
-      const pStart = engine.renderToOutArena(indexProg, indexVars);
+      const pSpan = engine.renderToOutArena(indexProg, indexVars);
       const outPath = k === 1 ? 'index.html' : `page/${k}/index.html`;
       builtSet.add(outPath);
-      emitPage(outPath, pStart, outPos);
+      emitPage(outPath, pSpan[0], pSpan[1]);
     }
   }
 
@@ -2639,18 +2436,18 @@ function buildSiteCore(input, emitPage, emitStatic) {
       reuseTag.url = t.url;
       reuseTag.count = t.posts.length;
       reuseTag.posts = tPosts;
-      const pStart = engine.renderToOutArena(tagProg, tagVars);
+      const pSpan = engine.renderToOutArena(tagProg, tagVars);
       const outPath = `tags/${t.slug}/index.html`;
       builtSet.add(outPath);
-      emitPage(outPath, pStart, outPos);
+      emitPage(outPath, pSpan[0], pSpan[1]);
     }
   }
 
   const tagsProg = engine.compileEntry('tags', 0, 'tags');
   if (tagsProg !== null) {
-    const pStart = engine.renderToOutArena(tagsProg, { site, tags: allTags, recent });
+    const pSpan = engine.renderToOutArena(tagsProg, { site, tags: allTags, recent });
     builtSet.add('tags/index.html');
-    emitPage('tags/index.html', pStart, outPos);
+    emitPage('tags/index.html', pSpan[0], pSpan[1]);
   }
 
   for (let i = 0; i < statics.length; i++) {
@@ -2677,99 +2474,63 @@ function jsonWriteAscii(str) {
   jsonPos = p;
 }
 
-function jsonWriteQuotedBytes(src, start, end) {
+function jsonWriteCtrl(c, dst, p) {
+  if (c === 34) { dst[p] = 92; dst[p + 1] = 34; return p + 2; }
+  if (c === 92) { dst[p] = 92; dst[p + 1] = 92; return p + 2; }
+  if (c === 10) { dst[p] = 92; dst[p + 1] = 110; return p + 2; }
+  if (c === 9) { dst[p] = 92; dst[p + 1] = 116; return p + 2; }
+  if (c === 13) { dst[p] = 92; dst[p + 1] = 114; return p + 2; }
+  if (c === 8) { dst[p] = 92; dst[p + 1] = 98; return p + 2; }
+  if (c === 12) { dst[p] = 92; dst[p + 1] = 102; return p + 2; }
+  dst[p] = 92; dst[p + 1] = 117; dst[p + 2] = 48; dst[p + 3] = 48;
+  dst[p + 4] = HEX_LO.charCodeAt(c >> 4);
+  dst[p + 5] = HEX_LO.charCodeAt(c & 15);
+  return p + 6;
+}
+
+// Fast SWAR writer dedicated solely to 4-byte aligned outArena pages (monomorphic -> zero deopt)
+function jsonWriteOutPage(start, end) {
   const len = end - start;
   if (jsonPos + len * 6 + 2 > jsonArena.length) ensureJson(len * 6 + 2);
+  const src = outArena;
   const dst = jsonArena;
+  const sp = JSON_SPECIAL;
   let p = jsonPos;
-  dst[p++] = 34; // "
-  let i = start;
+  dst[p++] = 34;
 
-  // Fast 4-byte aligned SWAR scan when src is outArena (4-byte aligned backing)
-  if (len >= 16 && src === outArena) {
-    while (i < end && (i & 3) !== 0) {
-      const c = src[i++];
-      if (JSON_SPECIAL[c] !== 0) {
-        if (c === 34) { dst[p++] = 92; dst[p++] = 34; }
-        else if (c === 92) { dst[p++] = 92; dst[p++] = 92; }
-        else if (c === 10) { dst[p++] = 92; dst[p++] = 110; }
-        else if (c === 13) { dst[p++] = 92; dst[p++] = 114; }
-        else if (c === 9) { dst[p++] = 92; dst[p++] = 116; }
-        else if (c === 8) { dst[p++] = 92; dst[p++] = 98; }
-        else if (c === 12) { dst[p++] = 92; dst[p++] = 102; }
-        else {
-          dst[p++] = 92; dst[p++] = 117; dst[p++] = 48; dst[p++] = 48;
-          dst[p++] = HEX_LO.charCodeAt(c >> 4);
-          dst[p++] = HEX_LO.charCodeAt(c & 15);
-        }
-      } else {
-        dst[p++] = c;
-      }
+  const u32 = outU32;
+  let wi = start >>> 2;
+  const wEnd = end >>> 2;
+  while (wi < wEnd) {
+    const w = u32[wi];
+    const lt32 = ~((w & 0x7f7f7f7f) + 0x60606060) & ~w & 0x80808080;
+    const xq = w ^ 0x22222222;
+    const eq34 = (xq - 0x01010101) & ~xq & 0x80808080;
+    const xb = w ^ 0x5c5c5c5c;
+    const eq92 = (xb - 0x01010101) & ~xb & 0x80808080;
+    if ((lt32 | eq34 | eq92) === 0) {
+      dst[p] = w & 255;
+      dst[p + 1] = (w >>> 8) & 255;
+      dst[p + 2] = (w >>> 16) & 255;
+      dst[p + 3] = w >>> 24;
+      p += 4;
+    } else {
+      const j = wi << 2;
+      const c0 = src[j], c1 = src[j + 1], c2 = src[j + 2], c3 = src[j + 3];
+      if (sp[c0] !== 0) p = jsonWriteCtrl(c0, dst, p); else dst[p++] = c0;
+      if (sp[c1] !== 0) p = jsonWriteCtrl(c1, dst, p); else dst[p++] = c1;
+      if (sp[c2] !== 0) p = jsonWriteCtrl(c2, dst, p); else dst[p++] = c2;
+      if (sp[c3] !== 0) p = jsonWriteCtrl(c3, dst, p); else dst[p++] = c3;
     }
-    const u32 = outU32;
-    let wi = i >>> 2;
-    const wEnd = end >>> 2;
-    while (wi < wEnd) {
-      const w = u32[wi];
-      const lt32 = ~((w & 0x7f7f7f7f) + 0x60606060) & ~w & 0x80808080;
-      const xq = w ^ 0x22222222;
-      const eq34 = (xq - 0x01010101) & ~xq & 0x80808080;
-      const xb = w ^ 0x5c5c5c5c;
-      const eq92 = (xb - 0x01010101) & ~xb & 0x80808080;
-      if ((lt32 | eq34 | eq92) === 0) {
-        dst[p] = w & 255;
-        dst[p + 1] = (w >>> 8) & 255;
-        dst[p + 2] = (w >>> 16) & 255;
-        dst[p + 3] = w >>> 24;
-        p += 4;
-        wi++;
-      } else {
-        const j = wi << 2;
-        for (let k = 0; k < 4; k++) {
-          const c = src[j + k];
-          if (JSON_SPECIAL[c] !== 0) {
-            if (c === 34) { dst[p++] = 92; dst[p++] = 34; }
-            else if (c === 92) { dst[p++] = 92; dst[p++] = 92; }
-            else if (c === 10) { dst[p++] = 92; dst[p++] = 110; }
-            else if (c === 13) { dst[p++] = 92; dst[p++] = 114; }
-            else if (c === 9) { dst[p++] = 92; dst[p++] = 116; }
-            else if (c === 8) { dst[p++] = 92; dst[p++] = 98; }
-            else if (c === 12) { dst[p++] = 92; dst[p++] = 102; }
-            else {
-              dst[p++] = 92; dst[p++] = 117; dst[p++] = 48; dst[p++] = 48;
-              dst[p++] = HEX_LO.charCodeAt(c >> 4);
-              dst[p++] = HEX_LO.charCodeAt(c & 15);
-            }
-          } else {
-            dst[p++] = c;
-          }
-        }
-        wi++;
-      }
-    }
-    i = wEnd << 2;
+    wi++;
   }
-
+  let i = wEnd << 2;
   while (i < end) {
     const c = src[i++];
-    if (JSON_SPECIAL[c] !== 0) {
-      if (c === 34) { dst[p++] = 92; dst[p++] = 34; }
-      else if (c === 92) { dst[p++] = 92; dst[p++] = 92; }
-      else if (c === 10) { dst[p++] = 92; dst[p++] = 110; }
-      else if (c === 13) { dst[p++] = 92; dst[p++] = 114; }
-      else if (c === 9) { dst[p++] = 92; dst[p++] = 116; }
-      else if (c === 8) { dst[p++] = 92; dst[p++] = 98; }
-      else if (c === 12) { dst[p++] = 92; dst[p++] = 102; }
-      else {
-        dst[p++] = 92; dst[p++] = 117; dst[p++] = 48; dst[p++] = 48;
-        dst[p++] = HEX_LO.charCodeAt(c >> 4);
-        dst[p++] = HEX_LO.charCodeAt(c & 15);
-      }
-    } else {
-      dst[p++] = c;
-    }
+    if (sp[c] !== 0) p = jsonWriteCtrl(c, dst, p);
+    else dst[p++] = c;
   }
-  dst[p++] = 34; // "
+  dst[p++] = 34;
   jsonPos = p;
 }
 
@@ -2777,7 +2538,19 @@ function jsonWriteQuotedStr(str) {
   const nb = Buffer.byteLength(str);
   ensureScratch(nb);
   scratchArena.utf8Write(str, 0);
-  jsonWriteQuotedBytes(scratchArena, 0, nb);
+  if (jsonPos + nb * 6 + 2 > jsonArena.length) ensureJson(nb * 6 + 2);
+  const dst = jsonArena;
+  const src = scratchArena;
+  const sp = JSON_SPECIAL;
+  let p = jsonPos;
+  dst[p++] = 34;
+  for (let i = 0; i < nb; i++) {
+    const c = src[i];
+    if (sp[c] !== 0) p = jsonWriteCtrl(c, dst, p);
+    else dst[p++] = c;
+  }
+  dst[p++] = 34;
+  jsonPos = p;
 }
 
 // ---------------------------------------------------------------- Exports
@@ -2819,7 +2592,7 @@ export function runCasesToBuffer(cases) {
         jsonWriteQuotedStr(path);
         if (jsonPos + 1 > jsonArena.length) ensureJson(1);
         jsonArena[jsonPos++] = 58; // :
-        jsonWriteQuotedBytes(outArena, start, end);
+        jsonWriteOutPage(start, end);
       },
       (path, str) => {
         if (!firstProp) {

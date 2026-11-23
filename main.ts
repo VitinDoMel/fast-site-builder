@@ -2,12 +2,9 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
-setFlagsFromString('--no-turbofan');
-setFlagsFromString('--no-concurrent-recompilation');
-setFlagsFromString('--no-concurrent-marking');
-setFlagsFromString('--no-concurrent-sweeping');
-setFlagsFromString('--no-parallel-scavenge');
-setFlagsFromString('--no-lazy');
+setFlagsFromString('--invocation-count-for-turbofan=30000');
+setFlagsFromString('--invocation-count-for-osr=8000');
+setFlagsFromString('--max-lazy');
 
 const { runCasesToBuffer } = await import('./solve.js');
 
