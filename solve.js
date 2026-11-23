@@ -609,6 +609,14 @@ function dirOf(path) {
 }
 
 function findNl(buf, pos, end) {
+  const lim = end - 3;
+  while (pos < lim) {
+    if (buf[pos] === 10) return pos;
+    if (buf[pos + 1] === 10) return pos + 1;
+    if (buf[pos + 2] === 10) return pos + 2;
+    if (buf[pos + 3] === 10) return pos + 3;
+    pos += 4;
+  }
   while (pos < end && buf[pos] !== 10) pos++;
   return pos;
 }
@@ -1278,7 +1286,7 @@ function renderMarkdownToArena(buf, startPos, len, env, slugifyBuf) {
       mdArena[mdPos++] = 62; // >
       mdArena[mdPos++] = 10; // \n
       if (depth === 2 || depth === 3) {
-        toc.push({ level: depth, id, htmlStart: hHtmlStart, htmlEnd: hHtmlEnd });
+        toc.push({ level: depth, id, htmlStart: hHtmlStart, htmlEnd: hHtmlEnd, _htmlStart: hHtmlStart, _htmlEnd: hHtmlEnd });
       }
       pos = nextPos;
       continue;
@@ -2216,16 +2224,6 @@ function buildSiteCore(input, emitPage, emitStatic) {
     s.excerptEnd = md.excerptEnd === -1 ? 0 : md.excerptEnd;
   }
 
-  // Wrap ToC items with _htmlStart/_htmlEnd for uniform resolvePath span access
-  for (let i = 0; i < kept.length; i++) {
-    const toc = kept[i].toc;
-    for (let j = 0; j < toc.length; j++) {
-      const h = toc[j];
-      h._htmlStart = h.htmlStart;
-      h._htmlEnd = h.htmlEnd;
-    }
-  }
-
   // 6. Collections
   const posts = [];
   for (let i = 0; i < kept.length; i++) {
@@ -2373,9 +2371,18 @@ function buildSiteCore(input, emitPage, emitStatic) {
   };
   const pageVars = { site, tags: allTags, recent, page: reusePage };
 
+  let lastLayout = '';
+  let lastProg = null;
+  const layoutProgs = new Map();
   for (let i = 0; i < kept.length; i++) {
     const s = kept[i];
-    const prog = engine.compileEntry(s.layout, 0, 'page');
+    let prog = s.layout === lastLayout ? lastProg : layoutProgs.get(s.layout);
+    if (prog === undefined) {
+      prog = engine.compileEntry(s.layout, 0, 'page');
+      layoutProgs.set(s.layout, prog);
+    }
+    lastLayout = s.layout;
+    lastProg = prog;
     const c = s.post ? s._card : cardOf(s, undefined);
     reusePage.title = c.title;
     reusePage.url = c.url;
